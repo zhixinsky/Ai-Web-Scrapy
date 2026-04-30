@@ -1,0 +1,71 @@
+{
+  "version": "1.0",
+  "exportTime": "2026-04-14T23:01:25+08:00",
+  "rules": [
+    {
+      "type": "field",
+      "field": "标题",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//h1[@data-pl='product-title']/text()"
+    },
+    {
+      "type": "list",
+      "field": "颜色",
+      "is_variant": true,
+      "parent_xpath": "",
+      "xpath": "//div[contains(@class, 'sku-item--skus')]//img",
+      "variant_name": "颜色"
+    },
+    {
+      "type": "list",
+      "field": "尺码",
+      "is_variant": true,
+      "parent_xpath": "",
+      "xpath": "//div[contains(@class, 'sku-item--skus')]//div/span",
+      "variant_name": "尺码"
+    },
+    {
+      "type": "main_image",
+      "field": "主图",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//img[contains(@class, 'magnifier--image')]",
+      "color_list_xpath": "(//div[@class=\"sku-item--skus--StEhULs\"])[1]/div"
+    },
+    {
+      "type": "gallery_image",
+      "field": "副图",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//div[contains(@class, 'slider--item--RpyeewA')]//img/@src"
+    },
+    {
+      "type": "description",
+      "field": "描述",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//ul[contains(@class, 'seo-sellpoints')]//text()"
+    },
+    {
+      "type": "detail",
+      "field": "详情",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//div[@class=\"specification--title--SfH3sA8\"]/span",
+      "value_xpath": "//div[@class=\"specification--desc--Dxx6W0W\"]/span"
+    },
+    {
+      "type": "gallery_image",
+      "field": "详情图",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "css: #product-description >>> img[slate-data-type=\"image\"]"
+    }
+  ],
+  "pre_click_xpath": "//*[@id=\"nav-specification\"]/button",
+  "pre_click_xpaths": [
+    "//*[@id=\"nav-specification\"]/button",
+    "//*[@id=\"nav-description\"]/div[2]/button"
+  ]
+}

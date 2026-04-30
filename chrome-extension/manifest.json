@@ -1,0 +1,35 @@
+{
+  "manifest_version": 3,
+  "name": "AI数据采集系统",
+  "version": "2.0.0",
+  "description": "登录后台、选择采集规则，在当前页执行 XPath 采集并上报日志与数据。",
+  "icons": {
+    "16": "16.png",
+    "48": "32.png",
+    "128": "128.png"
+  },
+  "permissions": [
+    "storage",
+    "sidePanel",
+    "scripting",
+    "tabs",
+    "downloads"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "AI数据采集系统",
+    "default_icon": {
+      "16": "16.png",
+      "48": "32.png",
+      "128": "128.png"
+    }
+  },
+  "side_panel": {
+    "default_path": "side_panel.html"
+  }
+}

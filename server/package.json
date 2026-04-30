@@ -1,0 +1,28 @@
+{
+  "name": "scraper-admin-api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch --watch-path ./src --watch-preserve-output src/index.js",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "@alicloud/sts-sdk": "^1.0.2",
+    "@volcengine/openapi": "^1.36.1",
+    "ali-oss": "^6.21.0",
+    "archiver": "^7.0.1",
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.10.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.4.1",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.1.1",
+    "openai": "^6.33.0",
+    "sharp": "^0.34.5",
+    "xlsx": "^0.18.5",
+    "xlsx-populate": "^1.21.0"
+  }
+}

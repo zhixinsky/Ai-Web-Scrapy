@@ -1,0 +1,65 @@
+# 采集后台：管理端静态页 + Node API（群晖 Container Manager / 通用 docker compose 可用）
+#
+# 部署前准备：
+# 1) 复制 server/.env.example 为 server/.env，填写 JWT_SECRET、DB 等（勿提交 .env）
+# 2) 构建前端：cd admin-ui && npm install && npm run build（生成 admin-ui/dist）
+# 3) 在含本文件的目录执行：docker compose build && docker compose up -d
+#
+# 说明：api 镜像将 chrome-extension/ 拷入 /workspace/server/chrome-extension，供「下载采集插件」。
+# 若需覆盖或自定义路径：可挂载到 /workspace/server/chrome-extension，或设 server/.env 中 COLLECTION_PLUGIN_SOURCE_DIR。
+#
+# 群晖若习惯把 .env 放在固定路径，可把下方 env_file 改为绝对路径，例如：
+#   - /volume1/docker/ai-scrapy/server/.env
+
+version: "3.8"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    container_name: scraper-api
+    restart: unless-stopped
+    env_file:
+      - ./server/.env
+    environment:
+      NODE_ENV: production
+      PORT: "3780"
+      DB_PATH: /data/data.db
+      TZ: Asia/Shanghai
+    volumes:
+      - scraper_data:/data
+      # 持久化：用户上传的空模板（uploads/export-templates）等
+      - scraper_uploads:/workspace/server/uploads
+      # （可选）用宿主机目录覆盖镜像内的采集插件，无需改镜像即可更新插件
+      # - ./chrome-extension:/workspace/server/chrome-extension:ro
+    expose:
+      - "3780"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"require('net').connect(3780,'127.0.0.1',()=>process.exit(0)).on('error',()=>process.exit(1))\"",
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+  web:
+    image: nginx:alpine
+    container_name: scraper-web
+    restart: unless-stopped
+    # 左边=宿主机端口（群晖可改 8806），右边=容器内 Nginx 监听 80
+    ports:
+      - "8806:80"
+    volumes:
+      - ./admin-ui/dist:/usr/share/nginx/html:ro
+      - ./deploy/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  scraper_data:
+  scraper_uploads:

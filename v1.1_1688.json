@@ -1,0 +1,67 @@
+{
+  "version": "1.0",
+  "exportTime": "2026-04-14T18:03:34+08:00",
+  "rules": [
+    {
+      "type": "field",
+      "field": "标题",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//div[@class=\"title-content\"]//text()"
+    },
+    {
+      "type": "list",
+      "field": "颜色",
+      "is_variant": true,
+      "parent_xpath": "",
+      "xpath": "/html[@lang=\"zh-CN\"]//div[@class=\"feature-item\"]/div[@class=\"transverse-filter\"]/button[contains(@class,\"sku-filter-button v-flex\")]//span",
+      "variant_name": "颜色"
+    },
+    {
+      "type": "list",
+      "field": "尺码",
+      "is_variant": true,
+      "parent_xpath": "",
+      "xpath": "/html[@lang=\"zh-CN\"]//div[@class=\"expand-view-list\"]//span[@class=\"item-label\"]",
+      "variant_name": "尺码"
+    },
+    {
+      "type": "main_image",
+      "field": "主图",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//img[contains(@class,\"ant-image-img preview-img\")]",
+      "color_list_xpath": "/html[@lang=\"zh-CN\"]//div[@class=\"feature-item\"]/div[@class=\"transverse-filter\"]/button[contains(@class,\"sku-filter-button v-flex\")]"
+    },
+    {
+      "type": "gallery_image",
+      "field": "副图",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//div[@class='od-scroller-item']//span[contains(@class, 'v-image-cover')]"
+    },
+    {
+      "type": "detail",
+      "field": "详情",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//th[@class=\"ant-descriptions-item-label\"]/span",
+      "value_xpath": "//td[@class=\"ant-descriptions-item-content\"]"
+    },
+    {
+      "type": "field",
+      "field": "价格",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "//p[contains(text(), \"1件起批\")]/preceding-sibling::div//span[@class=\"currency\"][1]/text()"
+    },
+    {
+      "type": "gallery_image",
+      "field": "详情图",
+      "is_variant": false,
+      "parent_xpath": "",
+      "xpath": "css:v-detail-1.html-description >>> #detail img"
+    }
+  ],
+  "pre_click_xpath": "/html[@lang=\"zh-CN\"]//div[@class=\"collapse-footer\"]/button[contains(@class,\"ant-btn-default\")]"
+}
