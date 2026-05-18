@@ -59,54 +59,56 @@ const MARK_FILTER_OPTIONS: readonly { value: CollectionMarkFilter; label: string
   { value: 'unmarked', label: '未标记' },
 ];
 
-/** 本页「快选平台」下拉：刷新 / 切模块后仍保留所选平台（sessionStorage） */
-function pagePlatformFilterStorageKey(mode: 'active' | 'archived'): string {
-  return `admin:collections:${mode}:pagePlatformFilter`;
+/** 本页「快选平台」下拉：刷新 / 切模块后仍保留所选平台（sessionStorage，按登录用户隔离） */
+function pagePlatformFilterStorageKey(mode: 'active' | 'archived', userId: number): string {
+  return `admin:collections:${mode}:pagePlatformFilter:u${userId}`;
 }
 
-function pageSearchStorageKey(mode: 'active' | 'archived'): string {
-  return `admin:collections:${mode}:search`;
+function pageSearchStorageKey(mode: 'active' | 'archived', userId: number): string {
+  return `admin:collections:${mode}:search:u${userId}`;
 }
 
-function lastSearchStorageKey(mode: 'active' | 'archived'): string {
-  return `admin:collections:${mode}:lastSearch`;
+function lastSearchStorageKey(mode: 'active' | 'archived', userId: number): string {
+  return `admin:collections:${mode}:lastSearch:u${userId}`;
 }
 
-function readStoredPagePlatformFilter(mode: 'active' | 'archived'): string {
+function readStoredPagePlatformFilter(mode: 'active' | 'archived', userId: number): string {
   try {
     if (typeof sessionStorage === 'undefined') return '';
-    return sessionStorage.getItem(pagePlatformFilterStorageKey(mode)) || '';
+    return sessionStorage.getItem(pagePlatformFilterStorageKey(mode, userId)) || '';
   } catch {
     return '';
   }
 }
 
-function persistPagePlatformFilter(mode: 'active' | 'archived', p: string) {
+function persistPagePlatformFilter(mode: 'active' | 'archived', userId: number, p: string) {
   try {
     if (typeof sessionStorage === 'undefined') return;
     const t = String(p || '').trim();
-    if (t) sessionStorage.setItem(pagePlatformFilterStorageKey(mode), t);
-    else sessionStorage.removeItem(pagePlatformFilterStorageKey(mode));
+    const key = pagePlatformFilterStorageKey(mode, userId);
+    if (t) sessionStorage.setItem(key, t);
+    else sessionStorage.removeItem(key);
   } catch {
     /* ignore */
   }
 }
 
-function readStoredSearchText(mode: 'active' | 'archived'): string {
+function readStoredSearchText(mode: 'active' | 'archived', userId: number): string {
   try {
     if (typeof sessionStorage === 'undefined') return '';
-    return sessionStorage.getItem(pageSearchStorageKey(mode)) || '';
+    return sessionStorage.getItem(pageSearchStorageKey(mode, userId)) || '';
   } catch {
     return '';
   }
 }
 
-function persistSearchText(mode: 'active' | 'archived', value: string) {
+function persistSearchText(mode: 'active' | 'archived', userId: number, value: string) {
   try {
     if (typeof sessionStorage === 'undefined') return;
     const t = String(value || '').trim();
-    if (t) sessionStorage.setItem(pageSearchStorageKey(mode), t);
-    else sessionStorage.removeItem(pageSearchStorageKey(mode));
+    const key = pageSearchStorageKey(mode, userId);
+    if (t) sessionStorage.setItem(key, t);
+    else sessionStorage.removeItem(key);
   } catch {
     /* ignore */
   }
@@ -272,7 +274,8 @@ export default function CollectionsPage({
   /** 按列表可视区域高度计算，随窗口变化；与底部分页独立，避免「大块留白」 */
   const [pageLimit, setPageLimit] = useState(12);
   const tableScrollViewportRef = useRef<HTMLDivElement>(null);
-  const [userIdFilter, setUserIdFilter] = useState<number | ''>('');
+  /** 管理员默认只看本人数据；选「全部用户」时为 '' */
+  const [userIdFilter, setUserIdFilter] = useState<number | ''>(() => (user.role === 'admin' ? user.id : ''));
   const [detailId, setDetailId] = useState<number | null>(null);
   const [detail, setDetail] = useState<Awaited<ReturnType<typeof api.collection>> | null>(null);
   const [users, setUsers] = useState<{ id: number; username: string }[]>([]);
@@ -289,12 +292,14 @@ export default function CollectionsPage({
     platformById: Record<number, string>;
   }>({ ids: [], platformById: {} });
   /** 列表「采集平台」筛选（服务端 WHERE）；与 URL + sessionStorage 同步，刷新/切模块不丢 */
-  const [pagePlatformFilter, setPagePlatformFilter] = useState<string>(() => readStoredPagePlatformFilter(mode));
+  const [pagePlatformFilter, setPagePlatformFilter] = useState<string>(() =>
+    readStoredPagePlatformFilter(mode, user.id)
+  );
   const [searchInput, setSearchInput] = useState<string>(() =>
-    COLLECTION_SEARCH_UI_ENABLED ? readStoredSearchText(mode) : ''
+    COLLECTION_SEARCH_UI_ENABLED ? readStoredSearchText(mode, user.id) : ''
   );
   const [searchText, setSearchText] = useState<string>(() =>
-    COLLECTION_SEARCH_UI_ENABLED ? readStoredSearchText(mode) : ''
+    COLLECTION_SEARCH_UI_ENABLED ? readStoredSearchText(mode, user.id) : ''
   );
 
   useEffect(() => {
@@ -313,6 +318,7 @@ export default function CollectionsPage({
   const [markSavingId, setMarkSavingId] = useState<number | null>(null);
   const [archivingSelected, setArchivingSelected] = useState(false);
   const [restoringSelected, setRestoringSelected] = useState(false);
+  const [copyingToMyArchiveSelected, setCopyingToMyArchiveSelected] = useState(false);
   const [pluginZipDownloading, setPluginZipDownloading] = useState(false);
   const [aiPromptModalOpen, setAiPromptModalOpen] = useState(false);
   const [aiPromptProfiles, setAiPromptProfiles] = useState<CollectionAiPromptProfilesResponse | null>(null);
@@ -340,7 +346,7 @@ export default function CollectionsPage({
         sp0.get('page') || sp0.get('userId') || sp0.get('mark') || sp0.get('platform') || sp0.get('q')
       );
       if (!hasAny && typeof sessionStorage !== 'undefined') {
-        const raw = sessionStorage.getItem(lastSearchStorageKey(mode)) || '';
+        const raw = sessionStorage.getItem(lastSearchStorageKey(mode, user.id)) || '';
         if (raw.trim()) {
           sp = new URLSearchParams(raw);
           setSearchParams(sp, { replace: true });
@@ -359,8 +365,12 @@ export default function CollectionsPage({
     if (Number.isFinite(p) && p >= 1) setPage(Math.floor(p));
 
     if (user.role === 'admin') {
-      const uid = Number(userIdRaw || '');
-      if (Number.isFinite(uid) && uid > 0) setUserIdFilter(Math.floor(uid));
+      const raw = String(userIdRaw ?? '').trim();
+      if (raw === '0') setUserIdFilter('');
+      else {
+        const uid = Number(raw);
+        if (Number.isFinite(uid) && uid > 0) setUserIdFilter(Math.floor(uid));
+      }
     }
 
     const mk = String(markRaw || '').trim() as CollectionMarkFilter;
@@ -370,21 +380,21 @@ export default function CollectionsPage({
     if (COLLECTION_SEARCH_UI_ENABLED) {
       setSearchInput(qRaw);
       setSearchText(qRaw);
-      persistSearchText(mode, qRaw);
+      persistSearchText(mode, user.id, qRaw);
     } else {
       setSearchInput('');
       setSearchText('');
-      persistSearchText(mode, '');
+      persistSearchText(mode, user.id, '');
     }
 
     const platformFromUrl = String(sp.get('platform') || '').trim();
     if (platformFromUrl) {
       setPagePlatformFilter(platformFromUrl);
-      persistPagePlatformFilter(mode, platformFromUrl);
+      persistPagePlatformFilter(mode, user.id, platformFromUrl);
     } else {
       try {
         if (typeof sessionStorage !== 'undefined') {
-          const st = sessionStorage.getItem(pagePlatformFilterStorageKey(mode)) || '';
+          const st = sessionStorage.getItem(pagePlatformFilterStorageKey(mode, user.id)) || '';
           if (st.trim()) {
             setPagePlatformFilter(st.trim());
           }
@@ -393,13 +403,16 @@ export default function CollectionsPage({
         /* ignore */
       }
     }
-  }, [mode, searchParams, setSearchParams, user.role]);
+  }, [mode, searchParams, setSearchParams, user.id, user.role]);
 
   // 筛选变化时同步 URL（刷新不丢）
   useEffect(() => {
     const next = new URLSearchParams();
     next.set('page', String(page));
-    if (user.role === 'admin' && userIdFilter !== '') next.set('userId', String(userIdFilter));
+    if (user.role === 'admin') {
+      if (userIdFilter === '') next.set('userId', '0');
+      else next.set('userId', String(userIdFilter));
+    }
     if (markFilter) next.set('mark', String(markFilter));
     const pf = pagePlatformFilter.trim();
     if (pf) next.set('platform', pf);
@@ -407,18 +420,18 @@ export default function CollectionsPage({
     if (qText) next.set('q', qText);
     setSearchParams(next, { replace: true });
 
-    persistPagePlatformFilter(mode, pagePlatformFilter);
-    persistSearchText(mode, COLLECTION_SEARCH_UI_ENABLED ? searchText : '');
+    persistPagePlatformFilter(mode, user.id, pagePlatformFilter);
+    persistSearchText(mode, user.id, COLLECTION_SEARCH_UI_ENABLED ? searchText : '');
 
     // 同步写入 sessionStorage：用于“切换模块 → 返回本页”恢复筛选
     try {
       if (typeof sessionStorage !== 'undefined') {
-        sessionStorage.setItem(lastSearchStorageKey(mode), next.toString());
+        sessionStorage.setItem(lastSearchStorageKey(mode, user.id), next.toString());
       }
     } catch {
       /* ignore */
     }
-  }, [mode, page, user.role, userIdFilter, markFilter, pagePlatformFilter, searchText, setSearchParams]);
+  }, [mode, page, user.id, user.role, userIdFilter, markFilter, pagePlatformFilter, searchText, setSearchParams]);
 
   const load = useCallback(async () => {
     setErr('');
@@ -466,6 +479,22 @@ export default function CollectionsPage({
     const maxPage = Math.max(1, Math.ceil(data.total / pageLimit));
     if (page > maxPage) setPage(maxPage);
   }, [data?.total, page, pageLimit]);
+
+  /** 已由当前管理员复制过的归档源不可勾选；列表刷新后剔除误选 */
+  useEffect(() => {
+    if (!isArchivedMode || user.role !== 'admin' || !data?.rows?.length) return;
+    const locked = new Set(data.rows.filter((r) => r.alreadyCopiedByMe).map((r) => r.id));
+    if (locked.size === 0) return;
+    setSel((prev) => {
+      const nextIds = prev.ids.filter((id) => !locked.has(id));
+      if (nextIds.length === prev.ids.length) return prev;
+      const platformById = { ...prev.platformById };
+      for (const id of locked) {
+        if (prev.ids.includes(id)) delete platformById[id];
+      }
+      return { ids: nextIds, platformById };
+    });
+  }, [data, isArchivedMode, user.role]);
 
   useEffect(() => {
     load();
@@ -595,7 +624,8 @@ export default function CollectionsPage({
       .catch(() => setDetail(null));
   }, [detailId]);
 
-  function toggleRowSelect(id: number, platform: string) {
+  function toggleRowSelect(id: number, platform: string, archiveCopyLocked?: boolean) {
+    if (archiveCopyLocked) return;
     const p = String(platform || '').trim();
     setSel((prev) => {
       if (prev.ids.includes(id)) {
@@ -780,36 +810,75 @@ export default function CollectionsPage({
     }
   }
 
+  async function copySelectedToMyArchive() {
+    if (sel.ids.length === 0) return;
+    if (user.role !== 'admin') return;
+    setErr('');
+    setCopyingToMyArchiveSelected(true);
+    try {
+      const r = await api.adminCopyCollectionsToMyArchive(sel.ids);
+      toastSuccess(`已复制 ${r.copied.length} 条到“我的归档”`, '复制成功');
+      setSel({ ids: [], platformById: {} });
+      await load();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '复制失败');
+    } finally {
+      setCopyingToMyArchiveSelected(false);
+    }
+  }
+
+  async function copyOneToMyArchive(id: number) {
+    if (user.role !== 'admin') return;
+    setErr('');
+    setCopyingToMyArchiveSelected(true);
+    try {
+      const r = await api.adminCopyCollectionsToMyArchive([id]);
+      toastSuccess(`已复制到“我的归档”：新ID ${r.copied?.[0]?.newId ?? '—'}`, '复制成功');
+      await load();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '复制失败');
+    } finally {
+      setCopyingToMyArchiveSelected(false);
+    }
+  }
+
   function toggleDetail(id: number) {
     setDetailId((prev) => (prev === id ? null : id));
   }
 
-  const pageRowIds = (data?.rows || []).map((r) => r.id);
+  const pageRows = data?.rows ?? [];
+  const pageRowIds = pageRows.map((r) => r.id);
+  function isArchiveCopyLockedRow(row: { alreadyCopiedByMe?: boolean }) {
+    return Boolean(isArchivedMode && user.role === 'admin' && row.alreadyCopiedByMe);
+  }
+  const selectablePageIds =
+    isArchivedMode && user.role === 'admin'
+      ? pageRows.filter((r) => !r.alreadyCopiedByMe).map((r) => r.id)
+      : pageRowIds;
   const allOnPageSelected =
-    pageRowIds.length > 0 && pageRowIds.every((id) => sel.ids.includes(id));
-  const anyOnPageSelected = pageRowIds.some((id) => sel.ids.includes(id));
+    selectablePageIds.length > 0 && selectablePageIds.every((id) => sel.ids.includes(id));
+  const anySelectableOnPageSelected = selectablePageIds.some((id) => sel.ids.includes(id));
   const pageTitle = isArchivedMode ? '归档库管理' : '数据采集管理';
   const emptyText = isArchivedMode ? '归档库暂无数据' : '暂无数据';
 
   function toggleSelectAllOnPage() {
     setSel((prev) => {
       const prevIds = Array.isArray(prev.ids) ? prev.ids : [];
-      if (pageRowIds.length === 0) return prev;
-      // 再点一次：取消本页全选（仅移除本页 id，保留其它页/其它筛选的勾选）
-      if (pageRowIds.every((id) => prevIds.includes(id))) {
+      if (selectablePageIds.length === 0) return prev;
+      // 再点一次：取消本页全选（移除本页全部 id，含不可选行上的误选）
+      if (selectablePageIds.every((id) => prevIds.includes(id))) {
         const next = prevIds.filter((id) => !pageRowIds.includes(id));
         const platformById = { ...prev.platformById };
         for (const id of pageRowIds) delete platformById[id];
         return { ...prev, ids: next, platformById };
       }
-      // 第一次点：全选本页（追加缺失 id，并写入 platform 供摘要显示）
+      // 全选本页：仅勾选可复制归档的行（管理员归档库）
       const set = new Set(prevIds);
       const platformById = { ...prev.platformById };
-      for (const row of data?.rows || []) {
-        if (pageRowIds.includes(row.id)) {
-          set.add(row.id);
-          platformById[row.id] = String(row.platform || '').trim();
-        }
+      for (const row of pageRows) {
+        if (!selectablePageIds.includes(row.id)) continue;
+        set.add(row.id);
+        platformById[row.id] = String(row.platform || '').trim();
       }
       return { ...prev, ids: [...set], platformById };
     });
@@ -826,13 +895,14 @@ export default function CollectionsPage({
                 <div className="flex justify-center">
                   <input
                     type="checkbox"
-                    className="h-4 w-4 rounded border-slate-300 text-teal-600"
+                    className="h-4 w-4 rounded border-slate-300 text-teal-600 disabled:cursor-not-allowed disabled:opacity-40"
                     checked={allOnPageSelected}
+                    disabled={selectablePageIds.length === 0}
                     onChange={toggleSelectAllOnPage}
                     aria-label={allOnPageSelected ? '取消全选（本页）' : '全选（本页）'}
                     ref={(el) => {
                       if (!el) return;
-                      el.indeterminate = anyOnPageSelected && !allOnPageSelected;
+                      el.indeterminate = anySelectableOnPageSelected && !allOnPageSelected;
                     }}
                   />
                 </div>
@@ -863,10 +933,17 @@ export default function CollectionsPage({
                   <div className="flex justify-center">
                     <input
                       type="checkbox"
-                      className="h-4 w-4 rounded border-slate-300 text-teal-600"
+                      className="h-4 w-4 rounded border-slate-300 text-teal-600 disabled:cursor-not-allowed disabled:opacity-40"
                       checked={sel.ids.includes(row.id)}
-                      onChange={() => toggleRowSelect(row.id, row.platform)}
-                      aria-label="勾选（批量导出、删除）"
+                      disabled={isArchiveCopyLockedRow(row)}
+                      onChange={() =>
+                        toggleRowSelect(row.id, row.platform, isArchiveCopyLockedRow(row))
+                      }
+                      aria-label={
+                        isArchiveCopyLockedRow(row)
+                          ? '已由当前账号复制过，不可勾选'
+                          : '勾选（批量导出、删除）'
+                      }
                     />
                   </div>
                 </td>
@@ -1041,6 +1118,21 @@ export default function CollectionsPage({
                         onClick={() => void restoreOne(row.id)}
                       >
                         恢复
+                      </button>
+                    ) : null}
+                    {isArchivedMode && user.role === 'admin' ? (
+                      <button
+                        type="button"
+                        className={`${tableActionCopyClass} disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:translate-y-0`}
+                        disabled={copyingToMyArchiveSelected || isArchiveCopyLockedRow(row)}
+                        onClick={() => void copyOneToMyArchive(row.id)}
+                        title={
+                          isArchiveCopyLockedRow(row)
+                            ? '已由当前账号复制过，不可再次复制'
+                            : '复制到当前管理员账号的归档库（生成新 ID 与新 SKU，导出状态重置为未导出）'
+                        }
+                      >
+                        复制归档
                       </button>
                     ) : null}
                     <button
@@ -1282,7 +1374,10 @@ export default function CollectionsPage({
         <div className="flex flex-col items-end gap-2">
           <div className="flex flex-wrap items-center justify-end gap-2">
             {COLLECTION_SEARCH_UI_ENABLED && (
-              <div className="flex items-center gap-2">
+              <div
+                className="flex h-10 min-w-[11rem] max-w-[18rem] flex-1 items-center rounded-full border border-slate-200 bg-white py-1 pl-3 pr-1 shadow-sm transition-[box-shadow,border-color] focus-within:border-teal-400 focus-within:ring-2 focus-within:ring-teal-400/25 sm:max-w-none sm:flex-initial sm:w-[15rem]"
+                title="搜索 ID / SKU / 用户名"
+              >
                 <input
                   type="search"
                   value={searchInput}
@@ -1302,11 +1397,11 @@ export default function CollectionsPage({
                     }
                   }}
                   placeholder="搜索 ID/SKU/用户"
-                  className="h-10 w-[10rem] rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 outline-none focus:border-teal-400"
+                  className="min-w-0 flex-1 border-0 bg-transparent py-1.5 pr-2 text-sm text-slate-700 outline-none placeholder:text-slate-400 [&::-webkit-search-cancel-button]:mr-1"
                 />
                 <button
                   type="button"
-                  className="rounded-lg border border-teal-600 bg-teal-600 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-700 active:bg-teal-800"
+                  className="shrink-0 rounded-full border border-teal-600 bg-teal-600 px-3.5 py-1.5 text-sm font-semibold text-white shadow-sm hover:bg-teal-700 active:bg-teal-800"
                   onClick={() => {
                     setPage(1);
                     setSearchText(searchInput.trim());
@@ -1374,15 +1469,28 @@ export default function CollectionsPage({
                 {archivingSelected ? '归档中…' : '移动到归档库'}
               </button>
             ) : (
-              <button
-                type="button"
-                disabled={sel.ids.length === 0 || restoringSelected}
-                onClick={() => void restoreSelected()}
-                className="rounded-lg border border-teal-200 bg-teal-50 px-3 py-2 text-sm font-medium text-teal-700 hover:bg-teal-100 disabled:cursor-not-allowed disabled:opacity-50"
-                title="将已勾选归档记录恢复回主列表"
-              >
-                {restoringSelected ? '恢复中…' : '批量恢复'}
-              </button>
+              <>
+                {user.role === 'admin' ? (
+                  <button
+                    type="button"
+                    disabled={sel.ids.length === 0 || copyingToMyArchiveSelected}
+                    onClick={() => void copySelectedToMyArchive()}
+                    className="rounded-lg border border-violet-200 bg-violet-50 px-3 py-2 text-sm font-medium text-violet-900 hover:bg-violet-100 disabled:cursor-not-allowed disabled:opacity-50"
+                    title="将已勾选归档记录复制到当前管理员账号的归档库（生成新 ID 与新 SKU，导出状态重置为未导出）"
+                  >
+                    {copyingToMyArchiveSelected ? '批量复制中…' : '批量复制归档'}
+                  </button>
+                ) : null}
+                <button
+                  type="button"
+                  disabled={sel.ids.length === 0 || restoringSelected}
+                  onClick={() => void restoreSelected()}
+                  className="rounded-lg border border-teal-200 bg-teal-50 px-3 py-2 text-sm font-medium text-teal-700 hover:bg-teal-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  title="将已勾选归档记录恢复回主列表"
+                >
+                  {restoringSelected ? '恢复中…' : '批量恢复'}
+                </button>
+              </>
             )}
             <button
               type="button"

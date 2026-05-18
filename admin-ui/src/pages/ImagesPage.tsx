@@ -1833,7 +1833,8 @@ export default function ImagesPage({ user }: { user: UserInfo }) {
   const didInitFromUrlRef = useRef(false);
   const [data, setData] = useState<Awaited<ReturnType<typeof api.imagesList>> | null>(null);
   const [page, setPage] = useState(1);
-  const [userIdFilter, setUserIdFilter] = useState<number | ''>('');
+  /** 管理员默认只看本人采集；选「全部」时为 '' */
+  const [userIdFilter, setUserIdFilter] = useState<number | ''>(() => (user.role === 'admin' ? user.id : ''));
   const [users, setUsers] = useState<{ id: number; username: string }[]>([]);
   const [err, setErr] = useState('');
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
@@ -2000,7 +2001,7 @@ export default function ImagesPage({ user }: { user: UserInfo }) {
     try {
       const hasAny = Boolean(sp0.get('page') || sp0.get('userId'));
       if (!hasAny && typeof sessionStorage !== 'undefined') {
-        const raw = sessionStorage.getItem('admin:images:lastSearch') || '';
+        const raw = sessionStorage.getItem(`admin:images:lastSearch:u${user.id}`) || '';
         if (raw.trim()) {
           sp = new URLSearchParams(raw);
           setSearchParams(sp, { replace: true });
@@ -2016,27 +2017,34 @@ export default function ImagesPage({ user }: { user: UserInfo }) {
     if (Number.isFinite(p) && p >= 1) setPage(Math.floor(p));
 
     if (user.role === 'admin') {
-      const uid = Number(userIdRaw || '');
-      if (Number.isFinite(uid) && uid > 0) setUserIdFilter(Math.floor(uid));
+      const raw = String(userIdRaw ?? '').trim();
+      if (raw === '0') setUserIdFilter('');
+      else {
+        const uid = Number(raw);
+        if (Number.isFinite(uid) && uid > 0) setUserIdFilter(Math.floor(uid));
+      }
     }
-  }, [searchParams, user.role]);
+  }, [searchParams, user.id, user.role]);
 
   // 筛选变化时同步 URL（刷新不丢）
   useEffect(() => {
     const next = new URLSearchParams();
     next.set('page', String(page));
-    if (user.role === 'admin' && userIdFilter !== '') next.set('userId', String(userIdFilter));
+    if (user.role === 'admin') {
+      if (userIdFilter === '') next.set('userId', '0');
+      else next.set('userId', String(userIdFilter));
+    }
     setSearchParams(next, { replace: true });
 
     // 同步写入 sessionStorage：用于“切换模块 → 返回本页”恢复筛选
     try {
       if (typeof sessionStorage !== 'undefined') {
-        sessionStorage.setItem('admin:images:lastSearch', next.toString());
+        sessionStorage.setItem(`admin:images:lastSearch:u${user.id}`, next.toString());
       }
     } catch {
       /* ignore */
     }
-  }, [page, user.role, userIdFilter, setSearchParams]);
+  }, [page, user.id, user.role, userIdFilter, setSearchParams]);
 
   const openMainLightbox = useCallback(
     (collectionId: number, slotIndex: number) => {

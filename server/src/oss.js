@@ -152,3 +152,49 @@ export async function deleteOssObjectsForCollection(collectionId, options = {}) 
   return { deleted: total };
 }
 
+/**
+ * 复制该采集 id 下 OSS 全部对象到另一个采集 id（保持相对路径不变）。
+ * 用于管理员“复制归档记录到自己账号”时保证图片资源可见。
+ *
+ * @param {number|string} srcCollectionId
+ * @param {number|string} dstCollectionId
+ * @param {{ skip?: boolean }} [options] skip=true 时不请求 OSS
+ * @returns {{ copied: number }}
+ */
+export async function copyOssObjectsForCollection(srcCollectionId, dstCollectionId, options = {}) {
+  if (options.skip) return { copied: 0 };
+  if (!getOssConfig().enabled) return { copied: 0 };
+  const srcPrefix = ossPrefixForCollectionFolder(srcCollectionId);
+  const dstPrefix = ossPrefixForCollectionFolder(dstCollectionId);
+  if (!srcPrefix || !dstPrefix) return { copied: 0 };
+  let client;
+  try {
+    client = newOssClient();
+  } catch {
+    return { copied: 0 };
+  }
+
+  let total = 0;
+  /** @type {string | null | undefined} */
+  let continuationToken;
+  const maxKeys = 500;
+  for (;;) {
+    const q = { prefix: srcPrefix, 'max-keys': maxKeys };
+    if (continuationToken) q['continuation-token'] = continuationToken;
+    const result = await client.listV2(q);
+    const names = (result.objects || []).map((o) => o.name).filter(Boolean);
+    for (const srcKey of names) {
+      if (!srcKey.startsWith(srcPrefix)) continue;
+      const suffix = srcKey.slice(srcPrefix.length);
+      const dstKey = `${dstPrefix}${suffix}`;
+      // ali-oss: copy(targetKey, sourceKey)
+      await client.copy(dstKey, srcKey);
+      total += 1;
+    }
+    if (!result.isTruncated) break;
+    continuationToken = result.nextContinuationToken || null;
+    if (!continuationToken) break;
+  }
+  return { copied: total };
+}
+

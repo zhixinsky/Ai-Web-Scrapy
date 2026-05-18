@@ -24,6 +24,7 @@ function withDraftSuffixIfNeeded(filename: string, mappingMode?: string): string
   if (!base) return base;
   if (base.endsWith('.zip')) return base.replace(/\.zip$/i, '_draftmap.zip');
   if (base.endsWith('.xlsx')) return base.replace(/\.xlsx$/i, '_draftmap.xlsx');
+  if (base.endsWith('.xlsm')) return base.replace(/\.xlsm$/i, '_draftmap.xlsm');
   if (base.endsWith('.csv')) return base.replace(/\.csv$/i, '_draftmap.csv');
   return `${base}_draftmap`;
 }
@@ -41,12 +42,13 @@ function exportDropdownPlatformSegment(fullLabel: string): string {
   return s;
 }
 
-/** 弹窗内与 StoredExportType 对齐的轻量形状（来自 GET /api/export/types） */
+/** 弹窗内与 GET /api/export/types 返回行对齐的轻量形状 */
 type ModalExportOption = {
   id: string;
   name: string;
   mode: 'amazon' | 'generic';
   destPlatform: string;
+  templateWorkbookExt: 'xlsx' | 'xlsm';
 };
 
 function rowsToOptions(rows: ServerExportTypeRow[]): ModalExportOption[] {
@@ -55,6 +57,7 @@ function rowsToOptions(rows: ServerExportTypeRow[]): ModalExportOption[] {
     name: r.name,
     mode: r.mode,
     destPlatform: String(r.destPlatformId || '').trim(),
+    templateWorkbookExt: r.templateWorkbookExt === 'xlsm' ? 'xlsm' : 'xlsx',
   }));
 }
 
@@ -170,13 +173,16 @@ export default function CollectionExportModal({
         exportTypeId: selectedType.id,
         ...(columnMapDraft ? { columnMapDraft } : {}),
       });
+      const workbookExt =
+        resp.workbookExt === 'xlsm' ? 'xlsm' : selectedType.templateWorkbookExt === 'xlsm' ? 'xlsm' : 'xlsx';
       const name = buildExportDownloadFilename(
         lockedDestPlatform,
         selectedType.name,
         effFormat,
         includeImages,
         selectedType.mode,
-        platforms
+        platforms,
+        workbookExt
       );
       downloadBlob(resp.blob, withDraftSuffixIfNeeded(name, resp.mappingMode));
       await onAfterDownload();

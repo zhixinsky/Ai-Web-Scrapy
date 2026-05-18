@@ -165,7 +165,7 @@ npm rebuild better-sqlite3
 ## 亚马逊等平台 Excel 导出
 
 - **导出类型目录**：`GET /api/export/types` 返回用户在「导出映射配置」中上传空模板后写入数据库的记录（每条含 `exportTypeId`、`destPlatformId` 等）；**导出目标平台**列表见 `GET /api/export/platforms`（内置平台 ID 与 `server/src/export/exportPlatformCatalog.js` 一致，例如亚马逊为 `00000000-0000-4000-8000-000000000001`，Temu、Shopee 等为后续固定 UUID）。
-- **填表逻辑**：服务端按 **持久化到磁盘的 xlsx 模板**（默认在 `server/uploads/export-templates/`，见 `server/.env.example` 说明）与保存的 **列映射草稿** 写入；通用填表与表头处理见 `server/src/export/fillExportTemplate.js`，**亚马逊变体扁平方** 等专用逻辑见 `server/src/export/amazonFlatExport.js`（占位列、父/子 SKU 等以代码为准）。
+- **填表逻辑**：服务端按 **持久化到磁盘的 xlsx 模板**（本地默认 `server/uploads/export-templates/`；Docker/群晖部署映射到宿主机 `/volume1/docker/ai-scrapy/data/uploads/export-templates/`）与保存的 **列映射草稿** 写入；通用填表与表头处理见 `server/src/export/fillExportTemplate.js`，**亚马逊变体扁平方** 等专用逻辑见 `server/src/export/amazonFlatExport.js`（占位列、父/子 SKU 等以代码为准）。
 - 导出表格中的图片 URL 依赖 **`PUBLIC_ORIGIN`**（或请求头推导）；若需匿名直链，可配置 **`PUBLIC_IMAGE_SIGNING_SECRET`**（见 `server/.env.example`）。
 
 ## 环境变量说明
@@ -202,17 +202,43 @@ npm rebuild better-sqlite3
 
 2. 准备 `server/.env`（与本地一致；**含 JWT、第三方 API、PUBLIC_ORIGIN、导出与图片相关等生产必填项**；Compose 会只读挂载进容器）。
 
-3. **修改** `docker-compose.yml` 中的 `JWT_SECRET` 与对外端口映射（示例为宿主 `8806:80`），勿把容器内 Nginx 监听端口改成宿主端口。
+3. 按需修改 `docker-compose.yml` 中的对外端口映射（示例为宿主 `8806:80`），勿把容器内 Nginx 监听端口改成宿主端口。生产环境密钥请写入 `server/.env`，不要提交到 Git。
 
-4. 启动：
+4. 群晖宿主机持久化目录：
+
+   ```bash
+   mkdir -p /volume1/docker/ai-scrapy/data/backup
+   mkdir -p /volume1/docker/ai-scrapy/data/uploads/export-templates
+   ```
+
+   当前 `docker-compose.yml` 映射关系：
+
+   ```yaml
+   /volume1/docker/ai-scrapy/data/backup:/data
+   /volume1/docker/ai-scrapy/data/uploads:/workspace/server/uploads
+   ```
+
+   对应文件位置：
+
+   - SQLite 数据库：`/volume1/docker/ai-scrapy/data/backup/data.db`
+   - 导出映射上传模板：`/volume1/docker/ai-scrapy/data/uploads/export-templates/`
+
+   若从旧容器/旧命名卷迁移到宿主机目录，重启前先从现有容器拷贝运行期数据：
+
+   ```bash
+   docker cp scraper-api:/data/. /volume1/docker/ai-scrapy/data/backup/
+   docker cp scraper-api:/workspace/server/uploads/. /volume1/docker/ai-scrapy/data/uploads/
+   ```
+
+5. 启动：
 
    ```bash
    docker compose up -d --build
    ```
 
-5. 浏览器访问 `http://<宿主IP>:8806`（端口以你修改后的为准）。
+6. 浏览器访问 `http://<宿主IP>:8806`（端口以你修改后的为准）。
 
-持久化数据在命名卷 `scraper_data`（容器内数据库路径为 `/data/data.db`）。
+重新构建镜像（`docker compose build`）不会删除数据；但首次切换为宿主机目录挂载前，必须先执行上面的 `docker cp`，否则空目录会让容器创建新的空数据库。
 
 ## 安全与隐私
 

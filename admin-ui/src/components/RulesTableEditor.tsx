@@ -72,6 +72,7 @@ export default function RulesTableEditor({
 }) {
   const [rows, setRows] = useState<RuleRow[]>([]);
   const [preClickListText, setPreClickListText] = useState('');
+  const [scrollToBottom, setScrollToBottom] = useState(value.scroll_to_bottom !== false);
   const preClickRef = useRef<HTMLTextAreaElement | null>(null);
 
   const autoResizePreClick = useCallback(() => {
@@ -112,6 +113,10 @@ export default function RulesTableEditor({
   }, [value]);
 
   useEffect(() => {
+    setScrollToBottom(value.scroll_to_bottom !== false);
+  }, [value.scroll_to_bottom]);
+
+  useEffect(() => {
     autoResizePreClick();
   }, [preClickListText, autoResizePreClick]);
 
@@ -123,16 +128,18 @@ export default function RulesTableEditor({
   }
 
   const emit = useCallback(
-    (nextRows: RuleRow[], preText: string) => {
+    (nextRows: RuleRow[], preText: string, scroll?: boolean) => {
       const list = parsePreClicks(preText);
+      const st = scroll !== undefined ? scroll : scrollToBottom;
       onChange({
         version: value.version || '1.0',
         rules: rowsToEngineRules(nextRows),
         pre_click_xpath: list[0] || '',
         pre_click_xpaths: list,
+        scroll_to_bottom: st,
       });
     },
-    [onChange, value.version]
+    [onChange, value.version, scrollToBottom]
   );
 
   function updateRow(i: number, patch: Partial<RuleRow>) {
@@ -183,8 +190,10 @@ export default function RulesTableEditor({
         const merged = [...arrPre];
         if (legacyPre && !merged.includes(legacyPre)) merged.push(legacyPre);
         const text = merged.join('\n');
+        const st = importData.scroll_to_bottom !== false;
+        setScrollToBottom(st);
         setPreClickListText(text);
-        emit(next.length ? next : [{ type: 'field', field: '', xpath: '', specialXpath: '' }], text);
+        emit(next.length ? next : [{ type: 'field', field: '', xpath: '', specialXpath: '' }], text, st);
       } catch {
         alert('解析 JSON 失败');
       }
@@ -201,6 +210,7 @@ export default function RulesTableEditor({
       rules,
       pre_click_xpath: preList[0] || '',
       pre_click_xpaths: preList,
+      scroll_to_bottom: scrollToBottom,
     };
     const jsonStr = JSON.stringify(exportData, null, 2);
     const blob = new Blob([jsonStr], { type: 'application/json' });
@@ -226,8 +236,23 @@ export default function RulesTableEditor({
           placeholder={'每行一条 XPath，按顺序执行点击。\n例如：\n//button[contains(., "展开")]\n//button[contains(., "加载更多")]'}
         />
         <p className="mt-1 text-xs text-slate-500">
-          插件在采集字段 XPath 之前：先整页滚动，再按顺序点击上述 XPath（可多条）。字段仍只由下方各规则 XPath 决定。
+          插件在采集字段 XPath 之前：可选整页滚动到底，再按顺序点击上述 XPath（可多条）。字段仍只由下方各规则 XPath 决定。
         </p>
+        <label className="mt-3 flex cursor-pointer items-start gap-2 text-sm text-slate-700">
+          <input
+            type="checkbox"
+            className="mt-0.5 rounded border-slate-300"
+            checked={scrollToBottom}
+            onChange={(e) => {
+              const v = e.target.checked;
+              setScrollToBottom(v);
+              emit(rows, preClickListText, v);
+            }}
+          />
+          <span>
+            采集前<strong>滚动页面到底</strong>（触发懒加载、详情图等）。1688 等可关短耗时；速卖通等有「加载更多」时建议保持开启。
+          </span>
+        </label>
       </div>
 
       <div className={tableActionRowWrapClass}>

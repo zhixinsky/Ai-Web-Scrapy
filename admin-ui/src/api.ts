@@ -176,6 +176,8 @@ export type ServerExportTypeRow = {
   columnCount: number;
   /** 表头行从左到右的列数（内置为 txt 行数；无内置时按映射估算） */
   headerColumnCount: number;
+  /** 上传空模板的后缀（xlsx / xlsm），与导出下载命名一致 */
+  templateWorkbookExt?: 'xlsx' | 'xlsm';
 };
 
 export type ExportPreviewResponse = {
@@ -197,6 +199,13 @@ export type ExportBlobResponse = {
   headerRow?: string;
   dataStartRow?: string;
   sheetName?: string;
+  /** 与上传模板一致的表格后缀（xlsx / xlsm），见响应头 X-Export-Workbook-Extension */
+  workbookExt?: 'xlsx' | 'xlsm';
+};
+
+export type ExportGenericPresetRow = {
+  excelHeader: string;
+  source: unknown;
 };
 
 export type CollectionAiPromptSettings = {
@@ -256,6 +265,15 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ ids }),
     }),
+  /** 管理员：复制其它用户归档记录到自己的归档库（新 ID + 新 SKU + 未导出；同步复制图片资源） */
+  adminCopyCollectionsToMyArchive: (ids: number[]) =>
+    request<{ ok: boolean; copied: Array<{ srcId: number; newId: number }> }>(
+      `/api/admin/collections/copy-to-my-archive`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ ids }),
+      }
+    ),
   setCollectionMark: (id: number, mark: CollectionUserMark | null) =>
     request<{ ok: boolean }>(`/api/collections/${id}/mark`, {
       method: 'PATCH',
@@ -555,7 +573,17 @@ export const api = {
       const headerRow = r.headers.get('x-export-columnmap-headerrow') || undefined;
       const dataStartRow = r.headers.get('x-export-columnmap-datastartrow') || undefined;
       const sheetName = r.headers.get('x-export-columnmap-sheetname') || undefined;
-      return { blob, mappingMode, mappingVersion, headerRow, dataStartRow, sheetName } as ExportBlobResponse;
+      const extRaw = (r.headers.get('x-export-workbook-extension') || '').trim().toLowerCase();
+      const workbookExt = extRaw === 'xlsm' ? ('xlsm' as const) : ('xlsx' as const);
+      return {
+        blob,
+        mappingMode,
+        mappingVersion,
+        headerRow,
+        dataStartRow,
+        sheetName,
+        workbookExt,
+      } as ExportBlobResponse;
     });
   },
   /** 图片资源管理：仅打包图片 zip（不含表格） */
@@ -611,6 +639,12 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(body),
     }),
+  /** 个人中心：是否采集后自动去背景 */
+  setMyCollectionAutoNobg: (enabled: boolean) =>
+    request<{ ok: boolean; collectionAutoNobg: boolean }>('/api/account/collection-auto-nobg', {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    }),
   changeMyPassword: (body: { oldPassword: string; newPassword: string }) =>
     request<{ ok: boolean }>('/api/account/change-password', {
       method: 'POST',
@@ -630,6 +664,33 @@ export const api = {
     }),
   deleteRule: (id: number) =>
     request<{ ok: boolean }>(`/api/admin/rules/${id}`, { method: 'DELETE' }),
+  skuDetectRules: () => request<{ rules: SkuDetectRule[] }>('/api/admin/sku-detect-rules'),
+  createSkuDetectRule: (body: SkuDetectRule) =>
+    request<{ id: number }>('/api/admin/sku-detect-rules', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateSkuDetectRule: (id: number, body: SkuDetectRule) =>
+    request<{ ok: boolean }>(`/api/admin/sku-detect-rules/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  deleteSkuDetectRule: (id: number) =>
+    request<{ ok: boolean }>(`/api/admin/sku-detect-rules/${id}`, { method: 'DELETE' }),
+  importSkuDetectRules: (body: unknown) =>
+    request<{ ok: boolean; count: number }>('/api/admin/sku-detect-rules/import', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  exportSkuDetectRules: () =>
+    request<{ version: string; exportTime: string; rules: SkuDetectRule[] }>('/api/admin/sku-detect-rules/export'),
+  testSkuDetectRules: (body: Record<string, unknown>) =>
+    requestWithTimeout<SkuDetectTestResponse>(
+      '/api/admin/sku-detect-rules/test',
+      { method: 'POST', body: JSON.stringify(body) },
+      90000,
+      'SKU 识别测试超时'
+    ),
   /** 登录即可：服务端维护的导出目标平台（名称 + 内部 id，用于导出类型与 exportDestPlatformId） */
   exportPlatforms: () =>
     request<{ platforms: ExportDestPlatform[] }>('/api/export/platforms'),
@@ -646,6 +707,13 @@ export const api = {
   /** 管理员：写入列映射草稿到服务器（app_settings） */
   putExportColumnMapDraft: (body: { exportTypeId: string; draft: unknown }) =>
     request<{ ok: boolean }>('/api/export/column-map-draft', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  /** 通用数据预设（每用户一份，全导出模板共享，存服务器 app_settings） */
+  getExportGenericPresets: () => request<{ rows: ExportGenericPresetRow[] }>('/api/export/generic-presets'),
+  putExportGenericPresets: (body: { rows: ExportGenericPresetRow[] }) =>
+    request<{ ok: boolean; count: number }>('/api/export/generic-presets', {
       method: 'PUT',
       body: JSON.stringify(body),
     }),
@@ -736,6 +804,24 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(body),
     }),
+  updateAdminExportTemplateMeta: (
+    id: string,
+    body: { sheetName: string; headerRow: number; dataStartRow: number }
+  ) =>
+    request<{
+      ok: boolean;
+      updatedAt: string;
+      template: {
+        id: string;
+        sheetName: string;
+        headerRow: number;
+        dataStartRow: number;
+        headers: string[];
+      };
+    }>(`/api/admin/export-templates/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
   /** 复制公开模板为当前用户私有模板 */
   adminCopyExportTemplate: (id: string) =>
     request<{
@@ -768,6 +854,8 @@ export type UserInfo = {
   planId?: string;
   /** 采集默认导出目标平台（UUID；空字符串表示未设置） */
   defaultExportPlatformId?: string;
+  /** 采集主副图下载完成后是否自动去背景（默认 true；关闭后可在图片资源中手动去背景） */
+  collectionAutoNobg?: boolean;
 };
 
 export type AdminUser = UserInfo & {
@@ -848,6 +936,10 @@ export type RuleConfig = {
   pre_click_xpath?: string;
   /** 多步页面预处理：按顺序执行（当前仅支持 XPath click），兼容旧字段 pre_click_xpath */
   pre_click_xpaths?: string[];
+  /**
+   * 采集前是否整页分段滚到底（触发懒加载/详情图）。默认 true；设为 false 可缩短耗时，详情图等可能不完整。
+   */
+  scroll_to_bottom?: boolean;
 };
 
 export type RuleDetail = {
@@ -856,6 +948,39 @@ export type RuleDetail = {
   platform: string;
   description: string;
   config: RuleConfig;
+};
+
+export type SkuDetectRule = {
+  id?: number;
+  name: string;
+  platform: string;
+  matchHost: string[];
+  enabled: boolean;
+  priority: number;
+  windowPaths: string[];
+  scriptKeywords: string[];
+  arrayDetectRules: {
+    requiredAnyKeys: string[];
+    optionalKeys: string[];
+    minItemCount: number;
+    maxDepth: number;
+  };
+  fieldMapping: Record<string, string[]>;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+export type SkuDetectTestResponse = {
+  ok: boolean;
+  matchedRule?: { id?: number; name: string; platform: string };
+  foundPath?: string;
+  source?: string;
+  rawCount?: number;
+  preview?: Record<string, unknown>[];
+  missing?: Record<string, number>;
+  attempts?: Record<string, unknown>[];
+  error?: string;
+  matchedRules?: string[];
 };
 
 /** storageRole：实际磁盘目录；role：逻辑槽位（替换接口仍用 main/gallery + index） */
@@ -964,6 +1089,8 @@ export type CollectionList = {
      * 不同用户相同地址不为 true。
      */
     urlDuplicate?: boolean;
+    /** 归档库列表：当前登录管理员是否已将本条作为源复制到自己的归档（不可再复制/勾选参与批量复制） */
+    alreadyCopiedByMe?: boolean;
   }[];
 };
 

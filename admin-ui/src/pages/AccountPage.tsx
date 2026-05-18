@@ -126,6 +126,8 @@ export default function AccountPage() {
   const [defaultExportPlatformId, setDefaultExportPlatformId] = useState<string>('');
   const [defaultExportBusy, setDefaultExportBusy] = useState(false);
   const [defaultExportMsg, setDefaultExportMsg] = useState('');
+  const [collectionAutoNobg, setCollectionAutoNobg] = useState(true);
+  const [collectionAutoNobgBusy, setCollectionAutoNobgBusy] = useState(false);
 
   useEffect(() => {
     if (!err) return;
@@ -142,6 +144,7 @@ export default function AccountPage() {
         if (cancelled) return;
         setMe(r.user);
         setDefaultExportPlatformId(String(r.user?.defaultExportPlatformId || '').trim());
+        setCollectionAutoNobg(r.user?.collectionAutoNobg !== false);
         setCredits(
           r.credits || { nobgCredits: 0, aiEraseCredits: 0, imageGenCredits: 0 }
         );
@@ -220,6 +223,21 @@ export default function AccountPage() {
     }
   }
 
+  async function saveCollectionAutoNobg(next: boolean) {
+    setCollectionAutoNobgBusy(true);
+    setErr('');
+    try {
+      const r = await api.setMyCollectionAutoNobg(next);
+      const on = r.collectionAutoNobg !== false;
+      setCollectionAutoNobg(on);
+      setMe((m) => (m ? { ...m, collectionAutoNobg: on } : m));
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setCollectionAutoNobgBusy(false);
+    }
+  }
+
   async function saveDefaultExportPlatform() {
     setDefaultExportMsg('');
     setErr('');
@@ -290,6 +308,32 @@ export default function AccountPage() {
             采集数据上报到服务器后，如插件未指定 <span className="font-medium">exportDestPlatformId</span>，将使用这里的默认导出平台，
             并按该平台触发 AI 富化流程（标题/描述/颜色/详情翻译/关键字等）。
           </p>
+
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4">
+            <div className="min-w-0 flex-1">
+              <div className="text-sm font-medium text-slate-800">采集后自动去背景</div>
+              <p className="mt-1 text-xs text-slate-500">
+                开启后，主图与副图下载完成将自动排队去背景（需服务端配置 Pixian 且账号次数充足）。关闭则只保留原图，可在「图片资源」中手动处理。
+              </p>
+            </div>
+            <button
+              type="button"
+              role="switch"
+              aria-checked={collectionAutoNobg}
+              disabled={collectionAutoNobgBusy}
+              onClick={() => void saveCollectionAutoNobg(!collectionAutoNobg)}
+              className={`relative h-8 w-14 shrink-0 rounded-full transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 focus-visible:ring-offset-2 disabled:opacity-50 ${
+                collectionAutoNobg ? 'bg-teal-600' : 'bg-slate-300'
+              }`}
+            >
+              <span
+                className={`absolute top-1 left-1 h-6 w-6 rounded-full bg-white shadow transition-transform ${
+                  collectionAutoNobg ? 'translate-x-6' : 'translate-x-0'
+                }`}
+              />
+              <span className="sr-only">{collectionAutoNobg ? '已开启' : '已关闭'}</span>
+            </button>
+          </div>
 
           <div className="mt-3 flex flex-wrap items-center gap-3">
             <label className="text-sm text-slate-600">默认导出平台</label>

@@ -167,7 +167,8 @@ export function buildExportDownloadFilename(
   format: 'csv' | 'xlsx',
   includeImages: boolean,
   mode: 'amazon' | 'generic',
-  platforms?: StoredExportPlatform[]
+  platforms?: StoredExportPlatform[],
+  workbookExt: 'xlsx' | 'xlsm' = 'xlsx'
 ): string {
   const iso = nowCstIsoLike();
   const stamp =
@@ -178,10 +179,11 @@ export function buildExportDownloadFilename(
   const dest = safeFilenamePart(destPlatformLabel(destPlatformId, platforms), 32);
   const tname = safeFilenamePart(typeName, 48);
   const base = `${dest}_${tname}_${stamp}`;
+  const xlext = workbookExt === 'xlsm' ? 'xlsm' : 'xlsx';
   if (includeImages && mode === 'amazon')
     return `${base}_含去背景图.zip`;
   if (includeImages) return `${base}_含图片.zip`;
   if (mode === 'amazon')
-    return format === 'xlsx' ? `${base}.xlsx` : `${base}.csv`;
-  return format === 'xlsx' ? `${base}.xlsx` : `${base}.csv`;
+    return format === 'xlsx' ? `${base}.${xlext}` : `${base}.csv`;
+  return format === 'xlsx' ? `${base}.${xlext}` : `${base}.csv`;
 }

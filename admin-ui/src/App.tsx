@@ -1,4 +1,4 @@
-import { Navigate, Route, Routes } from 'react-router-dom';
+import { Navigate, Route, Routes, useNavigate } from 'react-router-dom';
 import { useEffect, useState } from 'react';
 import {
   api,
@@ -56,6 +56,7 @@ function ModuleRoute({
 }
 
 export default function App() {
+  const navigate = useNavigate();
   const [user, setUser] = useState<UserInfo | null>(null);
   const [loading, setLoading] = useState(!!getToken());
 
@@ -86,10 +87,13 @@ export default function App() {
     setLoading(true);
     try {
       const full = await api.me();
-      setUser(normalizeUser(full));
+      const normalized = normalizeUser(full);
+      setUser(normalized);
+      navigate({ pathname: homePathForUser(normalized), search: '' }, { replace: true });
     } catch {
-      // 登录接口返回的 user 可能缺少 planId 等字段，这里兜底用它先进入系统
-      setUser(normalizeUser(u));
+      const normalized = normalizeUser(u);
+      setUser(normalized);
+      navigate({ pathname: homePathForUser(normalized), search: '' }, { replace: true });
     } finally {
       setLoading(false);
     }
@@ -98,6 +102,7 @@ export default function App() {
   function logout() {
     setToken(null);
     setUser(null);
+    navigate('/', { replace: true });
   }
 
   if (loading) {

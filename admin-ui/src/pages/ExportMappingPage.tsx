@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { CustomSelect, type CustomSelectOption } from '../components/CustomSelect';
 import { platformGlyphForName } from '../components/PlatformGlyph';
-import { api, type ExportDestPlatform, type ExportPreviewResponse, type UserInfo } from '../api';
+import { api, type ExportDestPlatform, type ExportGenericPresetRow, type ExportPreviewResponse, type UserInfo } from '../api';
 import { pushToast, toastError, toastSuccess } from '../utils/toast';
 import { stableStringify } from '../utils/stableStringify';
 
@@ -31,6 +31,13 @@ type ExportMappingDraft = {
   dataStartRow: number;
   headers: string[];
   columns: ColumnMappingEntry[];
+};
+
+/** 通用数据预设行（列名手填；来源/配置与主映射一致） */
+type GenericPresetRow = {
+  id: string;
+  excelHeader: string;
+  source: ColumnValueSource;
 };
 
 const STORAGE_KEY_PREFIX = 'admin-export-column-map:v1:';
@@ -391,6 +398,17 @@ function truncateDisplay(s: string, max: number): string {
   const t = String(s ?? '');
   if (t.length <= max) return t;
   return `${t.slice(0, max - 1)}…`;
+}
+
+function newGenericPresetRowId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch {
+    // ignore
+  }
+  return `g-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function ConfirmModal({
@@ -1090,6 +1108,7 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
   const [uploadDataStartRow, setUploadDataStartRow] = useState<number>(2);
   const uploadFileRef = useRef<HTMLInputElement | null>(null);
   const [saveBusy, setSaveBusy] = useState(false);
+  const [templateMetaSaveBusy, setTemplateMetaSaveBusy] = useState(false);
   /** 初始“草稿内容”快照：用于判断是否有改动（每个 exportTypeId 一份） */
   const initialDraftSnapshotRef = useRef<Record<string, string>>({});
   /** 初始快照是否已就绪（需等待服务端/本机草稿加载并应用完成） */
@@ -1104,6 +1123,22 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
   /** 当前打开「选择字段」弹窗的 excelHeader；常量/表达式用 constExprEditorFor */
   const [fieldPickerFor, setFieldPickerFor] = useState<string | null>(null);
   const [constExprEditorFor, setConstExprEditorFor] = useState<string | null>(null);
+  const [genericDataModalOpen, setGenericDataModalOpen] = useState(false);
+  const [genericPresetRows, setGenericPresetRows] = useState<GenericPresetRow[]>([]);
+  const [genericFieldPickerForId, setGenericFieldPickerForId] = useState<string | null>(null);
+  const [genericConstExprForId, setGenericConstExprForId] = useState<string | null>(null);
+  const [genericPresetLoadBusy, setGenericPresetLoadBusy] = useState(false);
+  const [genericPresetSaveBusy, setGenericPresetSaveBusy] = useState(false);
+  const genericPresetLoadedRef = useRef(false);
+  const genericApplyRunIdRef = useRef<string>('');
+  const genericApplySummaryRef = useRef<{
+    runId: string;
+    filledRows: number;
+    filledColumns: number;
+    matchedRows: number;
+    skippedColumns: number;
+  } | null>(null);
+  const genericImportFileRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     if (!err) return;
@@ -1115,6 +1150,91 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
     setFieldPickerFor(null);
     setConstExprEditorFor(null);
   }, [exportTypeId]);
+
+  useEffect(() => {
+    if (fieldPickerFor) setGenericFieldPickerForId(null);
+  }, [fieldPickerFor]);
+  useEffect(() => {
+    if (genericFieldPickerForId) setFieldPickerFor(null);
+  }, [genericFieldPickerForId]);
+  useEffect(() => {
+    if (constExprEditorFor) setGenericConstExprForId(null);
+  }, [constExprEditorFor]);
+  useEffect(() => {
+    if (genericConstExprForId) setConstExprEditorFor(null);
+  }, [genericConstExprForId]);
+
+  useEffect(() => {
+    if (!genericDataModalOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setGenericDataModalOpen(false);
+        setGenericFieldPickerForId(null);
+        setGenericConstExprForId(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [genericDataModalOpen]);
+
+  async function loadGenericPresetsOnce(opts?: { silent?: boolean; force?: boolean }) {
+    if (!opts?.force && genericPresetLoadedRef.current === true) return;
+    let rowsOut: GenericPresetRow[] = [];
+    setGenericPresetLoadBusy(true);
+    try {
+      const r = await api.getExportGenericPresets();
+      const rowsIn = Array.isArray(r.rows) ? r.rows : [];
+      const out: GenericPresetRow[] = [];
+      for (const entry of rowsIn) {
+        if (!entry || typeof entry !== 'object') continue;
+        const excelHeader = String((entry as any).excelHeader || '').trim();
+        if (!excelHeader) continue;
+        const srcAny = (entry as any).source;
+        if (!srcAny || typeof srcAny !== 'object' || Array.isArray(srcAny)) continue;
+        const t = String((srcAny as any).type || '').trim();
+        if (t === 'field') {
+          const key = String((srcAny as any).key || '').trim();
+          if (!key) continue;
+          out.push({ id: newGenericPresetRowId(), excelHeader, source: { type: 'field', key } });
+        } else if (t === 'const') {
+          const value = (srcAny as any).value == null ? '' : String((srcAny as any).value);
+          const applyToRaw = String((srcAny as any).applyTo || '').trim();
+          const applyTo =
+            applyToRaw === 'parent' || applyToRaw === 'child' || applyToRaw === 'both' ? applyToRaw : undefined;
+          out.push({
+            id: newGenericPresetRowId(),
+            excelHeader,
+            source: { type: 'const', value, ...(applyTo ? { applyTo } : {}) },
+          });
+        } else if (t === 'expr') {
+          const expr = String((srcAny as any).expr || '').trim();
+          if (!expr) continue;
+          const applyToRaw = String((srcAny as any).applyTo || '').trim();
+          const applyTo =
+            applyToRaw === 'parent' || applyToRaw === 'child' || applyToRaw === 'both' ? applyToRaw : undefined;
+          out.push({
+            id: newGenericPresetRowId(),
+            excelHeader,
+            source: { type: 'expr', expr, ...(applyTo ? { applyTo } : {}) },
+          });
+        }
+      }
+      rowsOut = out;
+      setGenericPresetRows(out);
+      genericPresetLoadedRef.current = true;
+    } catch (e) {
+      if (!opts?.silent) toastError(e instanceof Error ? e.message : '加载失败', '通用数据', 3200);
+    } finally {
+      setGenericPresetLoadBusy(false);
+    }
+    return rowsOut;
+  }
+
+  useEffect(() => {
+    if (!genericDataModalOpen) return;
+    // 每次打开弹窗都以服务器为准（用户级通用数据，与当前模板无关）
+    void loadGenericPresetsOnce({ force: true, silent: false });
+  }, [genericDataModalOpen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1297,6 +1417,12 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
     Number(selectedTemplate.isPublic) === 1 &&
     selectedTemplate.createdByUserId != null &&
     Number(selectedTemplate.createdByUserId) !== Number(user.id);
+  const templateMetaDirty =
+    !!selectedTemplate &&
+    !isSharedTemplate &&
+    (String(sheetName || '').trim() !== String(selectedTemplate.sheetName || '').trim() ||
+      Math.max(1, Number(headerRow) || 1) !== Math.max(1, Number(selectedTemplate.headerRow) || 1) ||
+      Math.max(1, Number(dataStartRow) || 1) !== Math.max(1, Number(selectedTemplate.dataStartRow) || 1));
 
   async function applyCustomTemplate(templateId: string) {
     setErr('');
@@ -1325,6 +1451,64 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
     if (!s.startsWith('custom:')) return;
     const id = s.slice('custom:'.length).trim();
     if (id) void applyCustomTemplate(id);
+  }
+
+  async function onSaveTemplateMeta() {
+    if (!selectedTemplateId || isSharedTemplate || templateMetaSaveBusy) return;
+    setErr('');
+    const nextSheetName = String(sheetName || '').trim();
+    const nextHeaderRow = Math.floor(Number(headerRow));
+    const nextDataStartRow = Math.floor(Number(dataStartRow));
+    if (!nextSheetName) {
+      setErr('sheetName 不能为空');
+      return;
+    }
+    if (!Number.isFinite(nextHeaderRow) || nextHeaderRow < 1) {
+      setErr('表头行必须是 >=1 的数字');
+      return;
+    }
+    if (!Number.isFinite(nextDataStartRow) || nextDataStartRow < 1) {
+      setErr('数据起始行必须是 >=1 的数字');
+      return;
+    }
+    if (nextDataStartRow <= nextHeaderRow) {
+      setErr('数据起始行必须大于表头行');
+      return;
+    }
+    if (!templateMetaDirty) {
+      toastInfo('未检测到模板参数变化', '无需保存', 1800);
+      return;
+    }
+    setTemplateMetaSaveBusy(true);
+    try {
+      const r = await api.updateAdminExportTemplateMeta(selectedTemplateId, {
+        sheetName: nextSheetName,
+        headerRow: nextHeaderRow,
+        dataStartRow: nextDataStartRow,
+      });
+      const t = r.template;
+      setSheetName(t.sheetName);
+      setHeaderRow(t.headerRow);
+      setDataStartRow(t.dataStartRow);
+      setHeaderText((Array.isArray(t.headers) ? t.headers : []).map((x) => String(x ?? '').trim()).join('\n'));
+      setCustomTemplates((prev) =>
+        prev.map((x) =>
+          x.id === selectedTemplateId
+            ? {
+                ...x,
+                sheetName: t.sheetName,
+                headerRow: t.headerRow,
+                dataStartRow: t.dataStartRow,
+              }
+            : x
+        )
+      );
+      toastSuccess('模板参数已保存，表头已重新解析', '保存成功');
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '保存模板参数失败');
+    } finally {
+      setTemplateMetaSaveBusy(false);
+    }
   }
 
   async function submitUploadTemplate() {
@@ -1583,6 +1767,38 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
     return out;
   }, [rightSelectOptions, fieldPickerFor, map]);
 
+  const genericFieldPickerOptions = useMemo(() => {
+    const row =
+      genericFieldPickerForId != null ? genericPresetRows.find((r) => r.id === genericFieldPickerForId) : null;
+    const cur =
+      row && row.source.type === 'field' ? normalizeFieldKey(String(row.source.key || '').trim()) : '';
+    let out = [...rightSelectOptions];
+    if (cur && !out.includes(cur)) out.push(cur);
+    out.sort((a, b) => String(a).localeCompare(String(b)));
+    return out;
+  }, [rightSelectOptions, genericFieldPickerForId, genericPresetRows]);
+
+  const genericPickerExcelHeader = useMemo(() => {
+    if (!genericFieldPickerForId) return '';
+    const row = genericPresetRows.find((r) => r.id === genericFieldPickerForId);
+    const h = String(row?.excelHeader || '').trim();
+    return h || '（未填写列名）';
+  }, [genericFieldPickerForId, genericPresetRows]);
+
+  const genericFieldPickerKeyValue = useMemo(() => {
+    if (!genericFieldPickerForId) return '';
+    const row = genericPresetRows.find((r) => r.id === genericFieldPickerForId);
+    return row && row.source.type === 'field' ? String(row.source.key || '') : '';
+  }, [genericFieldPickerForId, genericPresetRows]);
+
+  const genericConstExprEditorBundle = useMemo(() => {
+    if (!genericConstExprForId) return null;
+    const gRow = genericPresetRows.find((r) => r.id === genericConstExprForId);
+    const gSrc = gRow?.source;
+    if (!gRow || (gSrc?.type !== 'const' && gSrc?.type !== 'expr')) return null;
+    return { row: gRow, source: gSrc };
+  }, [genericConstExprForId, genericPresetRows]);
+
   const mappedCount = useMemo(
     () =>
       headerItems.filter(({ key }) => {
@@ -1616,6 +1832,8 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
 
   function applySourceTypeForHeader(headerKey: string, t: ColumnValueSource['type']) {
     if (isSharedTemplate) return;
+    setGenericFieldPickerForId(null);
+    setGenericConstExprForId(null);
     if (t === 'field') {
       setConstExprEditorFor(null);
       setSourceForHeader(headerKey, { type: 'field', key: '' });
@@ -1629,6 +1847,208 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
       setSourceForHeader(headerKey, { type: 'expr', expr: '{{}}', applyTo: 'both' });
       setConstExprEditorFor(headerKey);
     }
+  }
+
+  function updateGenericPresetRow(id: string, patch: Partial<Pick<GenericPresetRow, 'excelHeader' | 'source'>>) {
+    if (isSharedTemplate) return;
+    setGenericPresetRows((rows) => rows.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+  }
+
+  function setGenericRowSource(id: string, source: ColumnValueSource | null) {
+    if (isSharedTemplate) return;
+    setGenericPresetRows((rows) =>
+      rows.map((r) => {
+        if (r.id !== id) return r;
+        if (!source) return { ...r, source: { type: 'const', value: '', applyTo: 'child' } };
+        if (source.type === 'field') {
+          const nk = normalizeFieldKey(source.key);
+          return { ...r, source: nk ? { type: 'field', key: nk } : source };
+        }
+        return { ...r, source };
+      })
+    );
+  }
+
+  function applyGenericSourceType(rowId: string, t: ColumnValueSource['type']) {
+    if (isSharedTemplate) return;
+    setGenericConstExprForId(null);
+    setGenericFieldPickerForId(null);
+    if (t === 'field') {
+      setGenericRowSource(rowId, { type: 'field', key: '' });
+      setGenericFieldPickerForId(rowId);
+    } else if (t === 'const') {
+      setGenericRowSource(rowId, { type: 'const', value: '', applyTo: 'child' });
+      setGenericConstExprForId(rowId);
+    } else {
+      setGenericRowSource(rowId, { type: 'expr', expr: '{{}}', applyTo: 'both' });
+      setGenericConstExprForId(rowId);
+    }
+  }
+
+  function addGenericPresetRow() {
+    if (isSharedTemplate) return;
+    setGenericPresetRows((rows) => [
+      ...rows,
+      { id: newGenericPresetRowId(), excelHeader: '', source: { type: 'const', value: '', applyTo: 'child' } },
+    ]);
+  }
+
+  function removeGenericPresetRow(id: string) {
+    if (isSharedTemplate) return;
+    setGenericFieldPickerForId((cur) => (cur === id ? null : cur));
+    setGenericConstExprForId((cur) => (cur === id ? null : cur));
+    setGenericPresetRows((rows) => rows.filter((r) => r.id !== id));
+  }
+
+  function duplicateGenericPresetRow(id: string) {
+    if (isSharedTemplate) return;
+    setGenericPresetRows((rows) => {
+      const idx = rows.findIndex((r) => r.id === id);
+      if (idx < 0) return rows;
+      const base = rows[idx];
+      let nextSource: ColumnValueSource = base.source;
+      if (base.source.type === 'field') {
+        const k = String(base.source.key || '').trim();
+        const m = k.match(/^(.*?)(\d+)$/);
+        if (m) {
+          const prefix = m[1];
+          const n = Number(m[2]);
+          if (Number.isFinite(n)) nextSource = { type: 'field', key: `${prefix}${n + 1}` };
+        }
+      }
+      const copied: GenericPresetRow = {
+        id: newGenericPresetRowId(),
+        excelHeader: base.excelHeader,
+        source: nextSource,
+      };
+      const out = rows.slice();
+      out.splice(idx + 1, 0, copied);
+      return out;
+    });
+  }
+
+  function closeGenericDataModal() {
+    setGenericDataModalOpen(false);
+    setGenericFieldPickerForId(null);
+    setGenericConstExprForId(null);
+  }
+
+  async function onSaveGenericPresetsToServer() {
+    if (isSharedTemplate) return;
+    setGenericPresetSaveBusy(true);
+    try {
+      const rows: ExportGenericPresetRow[] = [];
+      for (const r of genericPresetRows) {
+        const excelHeader = String(r.excelHeader || '').trim();
+        if (!excelHeader) continue;
+        const s = r.source;
+        if (!s) continue;
+        if (s.type === 'field') {
+          const key = String(s.key || '').trim();
+          if (!key) continue;
+          rows.push({ excelHeader, source: { type: 'field', key } });
+          continue;
+        }
+        if (s.type === 'const') {
+          rows.push({
+            excelHeader,
+            source: {
+              type: 'const',
+              value: s.value == null ? '' : String(s.value),
+              ...(s.applyTo ? { applyTo: s.applyTo } : {}),
+            },
+          });
+          continue;
+        }
+        if (s.type === 'expr') {
+          const expr = String(s.expr || '').trim();
+          if (!expr) continue;
+          rows.push({
+            excelHeader,
+            source: { type: 'expr', expr, ...(s.applyTo ? { applyTo: s.applyTo } : {}) },
+          });
+          continue;
+        }
+      }
+      const r = await api.putExportGenericPresets({ rows });
+      toastSuccess(`已保存（${r.count} 行）`, '通用数据');
+      // 保存后立刻回读一次，确保“载入”看到的是服务端真实落库结果
+      genericPresetLoadedRef.current = false;
+      await loadGenericPresetsOnce({ force: true, silent: true });
+    } catch (e) {
+      toastError(e instanceof Error ? e.message : '保存失败', '通用数据', 3200);
+    } finally {
+      setGenericPresetSaveBusy(false);
+    }
+  }
+
+  function onExportGenericPresetJson() {
+    const rows = genericPresetRows
+      .map((r) => {
+        const excelHeader = String(r.excelHeader || '').trim();
+        if (!excelHeader) return null;
+        return { excelHeader, source: r.source };
+      })
+      .filter(Boolean);
+    downloadText(
+      `export_generic_presets_user.json`,
+      JSON.stringify({ version: 2, scope: 'user', rows }, null, 2)
+    );
+    toastSuccess('已导出', '通用数据', 1600);
+  }
+
+  function onImportGenericPresetJsonFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = typeof reader.result === 'string' ? reader.result : '';
+      const parsed = safeJsonParse(text);
+      const obj = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as any) : null;
+      const rowsIn = obj && Array.isArray(obj.rows) ? obj.rows : null;
+      if (!rowsIn) {
+        toastError('导入失败：JSON 格式不正确（缺少 rows）', '通用数据', 3200);
+        return;
+      }
+      const out: GenericPresetRow[] = [];
+      for (const entry of rowsIn) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        const excelHeader = String((entry as any).excelHeader || '').trim();
+        if (!excelHeader) continue;
+        const srcAny = (entry as any).source;
+        if (!srcAny || typeof srcAny !== 'object' || Array.isArray(srcAny)) continue;
+        const t = String((srcAny as any).type || '').trim();
+        if (t === 'field') {
+          const key = String((srcAny as any).key || '').trim();
+          if (!key) continue;
+          out.push({ id: newGenericPresetRowId(), excelHeader, source: { type: 'field', key } });
+        } else if (t === 'const') {
+          const value = (srcAny as any).value == null ? '' : String((srcAny as any).value);
+          const applyToRaw = String((srcAny as any).applyTo || '').trim();
+          const applyTo =
+            applyToRaw === 'parent' || applyToRaw === 'child' || applyToRaw === 'both' ? applyToRaw : undefined;
+          out.push({
+            id: newGenericPresetRowId(),
+            excelHeader,
+            source: { type: 'const', value, ...(applyTo ? { applyTo } : {}) },
+          });
+        } else if (t === 'expr') {
+          const expr = String((srcAny as any).expr || '').trim();
+          if (!expr) continue;
+          const applyToRaw = String((srcAny as any).applyTo || '').trim();
+          const applyTo =
+            applyToRaw === 'parent' || applyToRaw === 'child' || applyToRaw === 'both' ? applyToRaw : undefined;
+          out.push({
+            id: newGenericPresetRowId(),
+            excelHeader,
+            source: { type: 'expr', expr, ...(applyTo ? { applyTo } : {}) },
+          });
+        }
+      }
+      setGenericPresetRows(out);
+      genericPresetLoadedRef.current = true;
+      toastSuccess(`已导入（${out.length} 行）`, '通用数据', 2400);
+    };
+    reader.onerror = () => toastError('读取文件失败', '通用数据', 3200);
+    reader.readAsText(file);
   }
 
   function buildDraft(): ExportMappingDraft {
@@ -1712,6 +2132,183 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
     downloadText(`export_column_map_${exportTypeId}.json`, JSON.stringify(draft, null, 2));
   }
 
+  function onEditGenericData() {
+    setFieldPickerFor(null);
+    setConstExprEditorFor(null);
+    setGenericFieldPickerForId(null);
+    setGenericConstExprForId(null);
+    setGenericDataModalOpen(true);
+  }
+
+  async function onApplyGenericData() {
+    if (isSharedTemplate) return;
+    if (!exportTypeId) {
+      toastWarning('请先选择模板', '通用数据', 2400);
+      return;
+    }
+    if (!headers.length) {
+      toastWarning('模板列名为空', '通用数据', 2400);
+      return;
+    }
+    // 若用户未打开弹窗，也应能直接填充：这里确保先从服务器拉一次（用户级，与模板无关）
+    let loadedRows: GenericPresetRow[] | undefined;
+    if (genericPresetLoadedRef.current !== true) {
+      loadedRows = await loadGenericPresetsOnce({ silent: false });
+    }
+    const rowsToApply = (loadedRows && loadedRows.length ? loadedRows : genericPresetRows) || [];
+    if (!rowsToApply.length) {
+      toastWarning('暂无通用数据', '通用数据', 2200);
+      return;
+    }
+
+    const normalizeHeader = (s: string) =>
+      String(s ?? '')
+        .trim()
+        .replace(/\s+/g, ' ')
+        .replace(/[\u200B-\u200D\uFEFF]/g, '')
+        .toLowerCase();
+
+    const targetsByNorm = new Map<string, string[]>();
+    for (const { h, key } of headerItems) {
+      const nh = normalizeHeader(h);
+      if (!nh) continue;
+      const prev = targetsByNorm.get(nh);
+      if (prev) prev.push(key);
+      else targetsByNorm.set(nh, [key]);
+    }
+
+    // 通用数据按“同名列”分组，按出现顺序依次消费（支持同名列多条且 source 不同）。
+    const presetsByNorm = new Map<string, GenericPresetRow[]>();
+    for (const r of rowsToApply) {
+      const nh = normalizeHeader(r.excelHeader);
+      if (!nh) continue;
+      const arr = presetsByNorm.get(nh);
+      if (arr) arr.push(r);
+      else presetsByNorm.set(nh, [r]);
+    }
+    const runId = `gapply_${Date.now().toString(36)}_${Math.random().toString(16).slice(2, 10)}`;
+    genericApplyRunIdRef.current = runId;
+    genericApplySummaryRef.current = null;
+
+    setMap((prev) => {
+      // StrictMode(dev) 下 updater 可能被调用两次；这里必须是纯函数，不能依赖 updater 外的可变 cursor/计数。
+      const presetCursorByNorm = new Map<string, number>();
+      let matchedPresetRows = 0;
+      let filledColumns = 0;
+      let skippedColumns = 0;
+      const filledFromPresetRowIds = new Set<string>();
+
+      const next = { ...prev };
+      // 遍历模板列出现顺序：对每个列名，从对应的 presets 列表里取“下一条”填入
+      for (const [nh, keys] of targetsByNorm.entries()) {
+        if (!keys || keys.length === 0) continue;
+        const presetList = presetsByNorm.get(nh);
+        if (!presetList || presetList.length === 0) continue;
+        // 规则：若通用数据对某个列名只配置了 1 条，则无论模板里出现多少次，只填充“第一次出现”的那一列。
+        // 避免用户多次点击“填充通用数据”时把其它同名列也逐步填上。
+        if (presetList.length === 1) {
+          const firstKey = keys[0];
+          if (!firstKey) continue;
+          if (next[firstKey]) {
+            skippedColumns++;
+            continue;
+          }
+          const presetRow = presetList[0];
+          matchedPresetRows++;
+          const src = presetRow.source;
+          const normalizedSrc: ColumnValueSource =
+            src.type === 'field'
+              ? { type: 'field', key: normalizeFieldKey(src.key) }
+              : src.type === 'expr'
+                ? { type: 'expr', expr: src.expr, ...(src.applyTo ? { applyTo: src.applyTo } : {}) }
+                : { type: 'const', value: src.value, ...(src.applyTo ? { applyTo: src.applyTo } : {}) };
+          if (normalizedSrc.type === 'field' && !String(normalizedSrc.key || '').trim()) {
+            skippedColumns++;
+            continue;
+          }
+          if (normalizedSrc.type === 'expr' && !String(normalizedSrc.expr || '').trim()) {
+            skippedColumns++;
+            continue;
+          }
+          next[firstKey] = normalizedSrc;
+          filledColumns++;
+          filledFromPresetRowIds.add(presetRow.id);
+          continue;
+        }
+        for (const key of keys) {
+          const cur = next[key];
+          if (cur) {
+            skippedColumns++;
+            continue;
+          }
+
+          const curIdx = presetCursorByNorm.get(nh) ?? 0;
+          if (curIdx >= presetList.length) {
+            // 通用数据条数不够：不填充多出来的重复列
+            continue;
+          }
+          const presetRow = presetList[curIdx];
+          presetCursorByNorm.set(nh, curIdx + 1);
+
+          matchedPresetRows++;
+          const src = presetRow.source;
+          const normalizedSrc: ColumnValueSource =
+            src.type === 'field'
+              ? { type: 'field', key: normalizeFieldKey(src.key) }
+              : src.type === 'expr'
+                ? { type: 'expr', expr: src.expr, ...(src.applyTo ? { applyTo: src.applyTo } : {}) }
+                : { type: 'const', value: src.value, ...(src.applyTo ? { applyTo: src.applyTo } : {}) };
+
+          if (normalizedSrc.type === 'field' && !String(normalizedSrc.key || '').trim()) {
+            skippedColumns++;
+            continue;
+          }
+          if (normalizedSrc.type === 'expr' && !String(normalizedSrc.expr || '').trim()) {
+            skippedColumns++;
+            continue;
+          }
+          next[key] = normalizedSrc;
+          filledColumns++;
+          filledFromPresetRowIds.add(presetRow.id);
+        }
+      }
+      genericApplySummaryRef.current = {
+        runId,
+        filledRows: filledFromPresetRowIds.size,
+        filledColumns,
+        matchedRows: matchedPresetRows,
+        skippedColumns,
+      };
+      return next;
+    });
+
+    // updater 可能异步执行；这里轮询等待 summaryRef 就绪，再发 toast（避免首次无提示）。
+    const emitToastWhenReady = (tryN: number) => {
+      if (genericApplyRunIdRef.current !== runId) return;
+      const s = genericApplySummaryRef.current;
+      if (s && s.runId === runId) {
+        if (s.filledColumns > 0) {
+          toastSuccess(`已填充 ${s.filledRows} 行`, '通用数据', 2400);
+          return;
+        }
+        if (s.matchedRows > 0 && s.skippedColumns > 0) {
+          pushToast({
+            tone: 'info',
+            title: '通用数据',
+            message: '匹配到列名，但均已配置，未覆盖',
+            timeoutMs: 2400,
+          });
+          return;
+        }
+        toastWarning('未匹配到任何列名', '通用数据', 2400);
+        return;
+      }
+      if (tryN >= 10) return;
+      window.setTimeout(() => emitToastWhenReady(tryN + 1), 20);
+    };
+    window.setTimeout(() => emitToastWhenReady(0), 0);
+  }
+
   function onImportJsonFileConfirmed(file: File) {
     setErr('');
     const reader = new FileReader();
@@ -1757,15 +2354,18 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
     setPreview(null);
     const cid = Number(previewCollectionId);
     if (!Number.isFinite(cid) || cid <= 0) {
-      setErr('请输入有效的 collectionId 用于预览');
+      toastWarning('无效ID', '预览', 2200);
       return;
     }
     setPreviewBusy(true);
     try {
       const r = await api.exportPreview({ collectionId: cid, exportTypeId });
       setPreview(r);
+      if (r.parentRow == null && r.childRow == null) {
+        toastWarning('无数据', '预览', 2200);
+      }
     } catch (e) {
-      setErr(e instanceof Error ? e.message : '预览失败');
+      toastError(e instanceof Error ? e.message : '预览失败', '预览', 3200);
     } finally {
       setPreviewBusy(false);
     }
@@ -1910,21 +2510,10 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
             >
               {previewBusy ? '加载中…' : '加载预览'}
             </button>
-            {preview ? (
-              <div className="shrink-0 text-xs text-slate-500">
-                扁平行键：<span className="font-medium text-slate-800">{preview.availableKeys.length}</span>
-                {' · '}
-                字段白名单：<span className="font-medium text-slate-800">{AMAZON_EXPORT_FIELD_PICKER_KEYS.length}</span>
-              </div>
-            ) : (
-              <div className="shrink-0 text-xs text-slate-500">
-                字段白名单：<span className="font-medium text-slate-800">{AMAZON_EXPORT_FIELD_PICKER_KEYS.length}</span>
-              </div>
-            )}
           </div>
         </div>
 
-        <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-4 md:gap-x-4 md:gap-y-4">
+        <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-6 md:gap-x-4 md:gap-y-4">
           <div className="md:col-span-2">
             <label className="mb-2 block text-xs font-medium leading-relaxed text-slate-600">
               导出类型ID
@@ -1935,78 +2524,44 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
           </div>
 
           <div>
-            <label className="mb-2 block text-xs font-medium leading-relaxed text-slate-600">sheetName（只读）</label>
-            <div className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm leading-relaxed text-slate-800">
-              {sheetName || '—'}
-            </div>
+            <label className="mb-2 block text-xs font-medium leading-relaxed text-slate-600">sheetName</label>
+            <input
+              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm leading-relaxed text-slate-800 disabled:bg-slate-50 disabled:text-slate-500"
+              value={sheetName}
+              onChange={(e) => setSheetName(e.target.value)}
+              disabled={isSharedTemplate || !selectedTemplate}
+            />
           </div>
 
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <label className="mb-2 block text-xs font-medium leading-relaxed text-slate-600">表头行（只读）</label>
-              <div className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm leading-relaxed text-slate-800">
-                {headerRow}
-              </div>
-            </div>
-            <div>
-              <label className="mb-2 block text-xs font-medium leading-relaxed text-slate-600">数据起始行（只读）</label>
-              <div className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2.5 text-sm leading-relaxed text-slate-800">
-                {dataStartRow}
-              </div>
-            </div>
+          <div>
+            <label className="mb-2 block text-xs font-medium leading-relaxed text-slate-600">表头行</label>
+            <input
+              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm leading-relaxed text-slate-800 disabled:bg-slate-50 disabled:text-slate-500"
+              value={headerRow}
+              onChange={(e) => setHeaderRow(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+              disabled={isSharedTemplate || !selectedTemplate}
+              inputMode="numeric"
+            />
           </div>
-        </div>
-
-        <div className="mt-3 flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            className="rounded-lg bg-teal-600 px-3 py-2 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-50"
-            onClick={() => void onSave()}
-            disabled={saveBusy || isSharedTemplate}
-          >
-            {saveBusy ? '保存中…' : '保存到服务器'}
-          </button>
-          <button
-            type="button"
-            className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
-            onClick={onExportJson}
-            disabled={isSharedTemplate}
-          >
-            导出 JSON
-          </button>
-          <button
-            type="button"
-            className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
-            onClick={() => fileRef.current?.click()}
-            disabled={isSharedTemplate}
-          >
-            导入 JSON
-          </button>
-          <input
-            ref={fileRef}
-            type="file"
-            accept="application/json,.json"
-            className="hidden"
-            onChange={(e) => {
-              if (isSharedTemplate) {
-                e.currentTarget.value = '';
-                return;
-              }
-              const f = e.target.files?.[0];
-              if (!f) return;
-              if (!exportTypeId) {
-                setErr('请先选择正确的导出模板后再导入');
-                e.currentTarget.value = '';
-                return;
-              }
-              setImportPendingFile(f);
-              setImportConfirmOpen(true);
-              e.currentTarget.value = '';
-            }}
-          />
-
-          <div className="ml-auto text-xs text-slate-500">
-            已映射 <span className="font-medium text-slate-800">{mappedCount}</span> / {headers.length}
+          <div>
+            <label className="mb-2 block text-xs font-medium leading-relaxed text-slate-600">数据起始行</label>
+            <input
+              className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-sm leading-relaxed text-slate-800 disabled:bg-slate-50 disabled:text-slate-500"
+              value={dataStartRow}
+              onChange={(e) => setDataStartRow(Math.max(1, Math.floor(Number(e.target.value) || 1)))}
+              disabled={isSharedTemplate || !selectedTemplate}
+              inputMode="numeric"
+            />
+          </div>
+          <div className="flex items-end md:max-w-24">
+            <button
+              type="button"
+              className="h-[42px] w-20 rounded-lg bg-teal-600 px-3 text-sm font-medium text-white hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={() => void onSaveTemplateMeta()}
+              disabled={!templateMetaDirty || templateMetaSaveBusy || isSharedTemplate}
+            >
+              {templateMetaSaveBusy ? '保存中…' : '保存'}
+            </button>
           </div>
         </div>
 
@@ -2017,33 +2572,13 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
         ) : null}
 
         {/* errors are shown as toasts (top-right) */}
-
-        {preview ? (
-          <div className="mt-3 rounded-lg border border-slate-100 bg-slate-50/60 p-3">
-            {preview.parentRow == null && preview.childRow == null ? (
-              <p className="text-xs text-amber-800">
-                未生成父/子样例行（可能无变体数据或该 collection 无法构建导出样例），请换其它 collectionId 再试。
-              </p>
-            ) : null}
-            <p
-              className={`text-[11px] leading-relaxed text-slate-500 ${
-                preview.parentRow == null && preview.childRow == null ? 'mt-2' : ''
-              }`}
-            >
-              <span className="font-medium text-slate-600">父行 / 子行预览：</span>
-              后端各取一条 parent 与一条 child 样例。标题、描述、副图等很多列父子本就会一样；要看差异请映射{' '}
-              <span className="font-mono text-slate-700">item_sku</span>、
-              <span className="font-mono text-slate-700">parent_child</span>、颜色/尺码/价格等字段。若该条数据没有变体行，子样例为空，子列会整列空。
-            </p>
-          </div>
-        ) : null}
       </div>
 
       <div className="min-h-0">
           <div className="flex min-h-0 flex-col rounded-xl border border-slate-200 bg-white shadow-sm">
             <div className="border-b border-slate-100 p-4">
-              <div className="flex flex-wrap items-end gap-3">
-                <div className="min-w-[12rem] flex-1">
+              <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
+                <div className="w-full sm:w-[32rem]">
                   <label className="mb-1 block text-xs font-medium text-slate-600">
                     搜索（当前显示 <span className="font-medium text-slate-800">{filtered.length}</span> 列）
                   </label>
@@ -2054,19 +2589,91 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
                     placeholder="例如：主图、item_sku、bullet、价格…"
                   />
                 </div>
+                <button
+                  type="button"
+                  className="rounded-lg bg-teal-600 px-3 py-2 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-50"
+                  onClick={() => void onSave()}
+                  disabled={saveBusy || isSharedTemplate}
+                >
+                  {saveBusy ? '保存中…' : '保存到服务器'}
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50"
+                  onClick={onExportJson}
+                  disabled={isSharedTemplate}
+                >
+                  导出 JSON
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={() => fileRef.current?.click()}
+                  disabled={isSharedTemplate}
+                >
+                  导入 JSON
+                </button>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="application/json,.json"
+                  className="hidden"
+                  onChange={(e) => {
+                    if (isSharedTemplate) {
+                      e.currentTarget.value = '';
+                      return;
+                    }
+                    const f = e.target.files?.[0];
+                    if (!f) return;
+                    if (!exportTypeId) {
+                      setErr('请先选择正确的导出模板后再导入');
+                      e.currentTarget.value = '';
+                      return;
+                    }
+                    setImportPendingFile(f);
+                    setImportConfirmOpen(true);
+                    e.currentTarget.value = '';
+                  }}
+                />
+
+                <div
+                  className="mx-2 h-10 w-px shrink-0 self-end bg-slate-200"
+                  aria-hidden
+                  role="presentation"
+                />
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={onEditGenericData}
+                  disabled={isSharedTemplate}
+                >
+                  编辑通用数据
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg border border-teal-200 bg-teal-50/60 px-3 py-2 text-sm text-teal-800 hover:bg-teal-100/70 disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={onApplyGenericData}
+                  disabled={isSharedTemplate}
+                >
+                  填充通用数据
+                </button>
+
+                <div className="ml-auto text-xs text-slate-500">
+                  已映射 <span className="font-medium text-slate-800">{mappedCount}</span> / {headers.length}
+                </div>
               </div>
             </div>
 
             <div className="min-h-0 flex-1 overflow-auto">
-              <table className="w-full min-w-[64rem] table-fixed border-collapse text-sm">
+              <table className="w-full min-w-[82rem] table-fixed border-collapse text-sm">
                 <thead className="sticky top-0 bg-slate-50/90 backdrop-blur">
                   <tr className="border-b border-slate-100 text-xs font-medium text-slate-600">
                     <th className="w-10 px-3 py-2 text-left">#</th>
-                    <th className="w-[36rem] min-w-0 px-3 py-2 text-center">模板列名（excelHeader）</th>
+                    <th className="w-[22rem] min-w-0 px-3 py-2 text-center">模板列名（excelHeader）</th>
                     <th className="w-[7rem] min-w-0 px-2 py-2 text-center">来源</th>
-                    <th className="w-[26rem] min-w-0 px-3 py-2 text-center">配置</th>
-                    <th className="min-w-0 px-3 py-2 text-center">父行预览</th>
-                    <th className="min-w-0 px-3 py-2 text-center">子行预览</th>
+                    <th className="w-[22rem] min-w-0 px-3 py-2 text-center">配置</th>
+                    <th className="w-[14rem] min-w-0 px-3 py-2 text-center">父行预览</th>
+                    <th className="w-[14rem] min-w-0 px-3 py-2 text-center">子行预览</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -2084,7 +2691,7 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
                         onClick={() => setSelectedHeaderKey(key)}
                       >
                         <td className="px-3 py-2 font-mono text-[11px] text-slate-400">{i + 1}</td>
-                        <td className="w-[36rem] min-w-0 max-w-[36rem] px-3 py-2 text-center align-middle">
+                        <td className="w-[22rem] min-w-0 max-w-[22rem] px-3 py-2 text-center align-middle">
                           <div
                             className="max-h-[min(24rem,50vh)] overflow-y-auto break-all text-center font-mono text-[11px] leading-relaxed text-slate-700 whitespace-pre-wrap select-text"
                             title={h.length > 200 ? h : undefined}
@@ -2105,7 +2712,7 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
                             buttonClassName="flex h-10 w-full min-w-0 items-center justify-center gap-1 rounded-lg border border-slate-200 bg-white px-2 text-sm text-slate-800 shadow-none outline-none ring-0 transition hover:border-slate-300 focus:border-teal-400 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
                           />
                         </td>
-                        <td className="w-[26rem] min-w-0 max-w-[26rem] px-3 py-2 text-center align-middle" onClick={(e) => e.stopPropagation()}>
+                        <td className="w-[22rem] min-w-0 max-w-[22rem] px-3 py-2 text-center align-middle" onClick={(e) => e.stopPropagation()}>
                           {st === 'field' ? (
                             <button
                               type="button"
@@ -2192,13 +2799,13 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
                             </button>
                           )}
                         </td>
-                        <td className="px-3 py-2 text-center align-middle">
-                          <div className="mx-auto max-w-[36rem] break-all text-center font-mono text-[11px] text-slate-600">
+                        <td className="w-[14rem] min-w-0 max-w-[14rem] px-3 py-2 text-center align-middle">
+                          <div className="max-h-[min(24rem,50vh)] overflow-y-auto break-all text-center font-mono text-[11px] text-slate-600">
                             {parentPreview}
                           </div>
                         </td>
-                        <td className="px-3 py-2 text-center align-middle">
-                          <div className="mx-auto max-w-[36rem] break-all text-center font-mono text-[11px] text-slate-600">
+                        <td className="w-[14rem] min-w-0 max-w-[14rem] px-3 py-2 text-center align-middle">
+                          <div className="max-h-[min(24rem,50vh)] overflow-y-auto break-all text-center font-mono text-[11px] text-slate-600">
                             {childPreview}
                           </div>
                         </td>
@@ -2217,6 +2824,264 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
             </div>
           </div>
         </div>
+
+      {genericDataModalOpen ? (
+        <div
+          className="app-modal-backdrop fixed inset-0 z-[280] flex items-center justify-center p-4"
+          role="presentation"
+        >
+          <div
+            role="dialog"
+            aria-modal
+            aria-labelledby="generic-data-modal-title"
+            className="flex max-h-[min(44rem,92vh)] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-slate-200/90 bg-white shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="border-b border-slate-100 px-4 py-3">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <h2 id="generic-data-modal-title" className="text-sm font-semibold text-slate-800">
+                    编辑通用数据
+                  </h2>
+                  <p className="mt-1 text-[11px] leading-relaxed text-slate-500">
+                    模板列名请手填（与 Excel 表头一致）；来源与配置与主映射表相同。保存后对本账号下所有导出模板生效。
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    onClick={onExportGenericPresetJson}
+                    disabled={genericPresetLoadBusy || genericPresetSaveBusy}
+                  >
+                    导出
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+                    onClick={() => genericImportFileRef.current?.click()}
+                    disabled={isSharedTemplate || genericPresetLoadBusy || genericPresetSaveBusy}
+                  >
+                    导入
+                  </button>
+                  <input
+                    ref={genericImportFileRef}
+                    type="file"
+                    accept="application/json,.json"
+                    className="hidden"
+                    onChange={(e) => {
+                      if (isSharedTemplate) {
+                        e.currentTarget.value = '';
+                        return;
+                      }
+                      const f = e.target.files?.[0];
+                      if (!f) return;
+                      onImportGenericPresetJsonFile(f);
+                      e.currentTarget.value = '';
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto px-4 py-3">
+              <table className="w-full min-w-[48rem] table-fixed border-collapse text-sm">
+                <thead className="bg-slate-50/90">
+                  <tr className="border-b border-slate-100 text-xs font-medium text-slate-600">
+                    <th className="min-w-0 px-3 py-2 text-center">模板列名（excelHeader）</th>
+                    <th className="w-[7rem] min-w-0 px-2 py-2 text-center">来源</th>
+                    <th className="w-[22rem] min-w-0 px-3 py-2 text-center">配置</th>
+                    <th className="w-[7.5rem] shrink-0 px-2 py-2 text-center">操作</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {genericPresetRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={4} className="px-3 py-8 text-center text-sm text-slate-500">
+                        暂无行，请点击下方「添加一行」录入通用数据。
+                      </td>
+                    </tr>
+                  ) : (
+                    genericPresetRows.map((row) => {
+                      const src = row.source;
+                      const st = src.type;
+                      return (
+                        <tr key={row.id} className="border-b border-slate-50 last:border-0">
+                          <td className="min-w-0 px-3 py-2 align-middle">
+                            <input
+                              type="text"
+                              className="h-10 w-full min-w-0 rounded-lg border border-slate-200 bg-white px-2 text-center font-mono text-[11px] text-slate-800 outline-none focus:border-teal-400 disabled:cursor-not-allowed disabled:bg-slate-50 disabled:opacity-60"
+                              value={row.excelHeader}
+                              onChange={(e) => updateGenericPresetRow(row.id, { excelHeader: e.target.value })}
+                              placeholder="填写与模板一致的列名"
+                              disabled={isSharedTemplate}
+                            />
+                          </td>
+                          <td className="w-[7rem] min-w-0 max-w-[7rem] px-2 py-2 text-center align-middle">
+                            <CustomSelect
+                              value={st}
+                              onChange={(v) => applyGenericSourceType(row.id, v as ColumnValueSource['type'])}
+                              options={[
+                                { value: 'const', label: '常量' },
+                                { value: 'field', label: '字段' },
+                                { value: 'expr', label: '表达式' },
+                              ]}
+                              className="w-full min-w-0"
+                              buttonClassName="flex h-10 w-full min-w-0 items-center justify-center gap-1 rounded-lg border border-slate-200 bg-white px-2 text-sm text-slate-800 shadow-none outline-none ring-0 transition hover:border-slate-300 focus:border-teal-400 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                              disabled={isSharedTemplate}
+                            />
+                          </td>
+                          <td className="w-[22rem] min-w-0 max-w-[22rem] px-3 py-2 text-center align-middle">
+                            {st === 'field' ? (
+                              <button
+                                type="button"
+                                className="group flex h-10 w-full min-w-0 items-center justify-between gap-1.5 rounded-lg border border-orange-300/90 bg-white px-2 text-left text-sm transition hover:border-orange-400/90 hover:bg-orange-50/40 disabled:cursor-not-allowed disabled:opacity-60"
+                                onClick={() => setGenericFieldPickerForId(row.id)}
+                                disabled={isSharedTemplate}
+                              >
+                                <span className="min-w-0 flex-1 truncate">
+                                  {src.type === 'field' && String(src.key || '').trim() ? (
+                                    <>
+                                      <span className="font-medium text-slate-800">
+                                        {getKeyLabelForDisplay(src.key) || src.key}
+                                      </span>
+                                      {getKeyLabelForDisplay(src.key) ? (
+                                        <span className="text-slate-500">（{src.key}）</span>
+                                      ) : null}
+                                    </>
+                                  ) : (
+                                    <span className="text-slate-400">点击选择字段…</span>
+                                  )}
+                                </span>
+                                <span className="shrink-0 rounded bg-slate-100 px-2 py-0.5 text-[11px] font-medium leading-none text-slate-600 group-hover:bg-teal-100 group-hover:text-teal-800">
+                                  选择
+                                </span>
+                              </button>
+                            ) : st === 'const' ? (
+                              <button
+                                type="button"
+                                className={`group flex h-10 w-full min-w-0 items-center justify-between gap-1.5 rounded-lg border px-2 text-left text-sm transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                                  src.type === 'const' && String(src.value).trim()
+                                    ? 'border-emerald-300/90 bg-emerald-50/40 hover:border-emerald-400/90 hover:bg-emerald-50/60'
+                                    : 'border-slate-200 bg-white hover:border-emerald-300 hover:bg-emerald-50/50'
+                                }`}
+                                onClick={() => {
+                                  if (src.type !== 'const') {
+                                    setGenericRowSource(row.id, { type: 'const', value: '', applyTo: 'child' });
+                                  }
+                                  setGenericConstExprForId(row.id);
+                                }}
+                                disabled={isSharedTemplate}
+                              >
+                                <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-slate-800">
+                                  常量 ·{' '}
+                                  {src.type === 'const' ? applyToShortLabel(getConstExprApplyTo(src)) : '父行与子行'} ·{' '}
+                                  {src.type === 'const' && String(src.value).trim() ? (
+                                    <span className="rounded bg-emerald-200/80 px-1.5 py-0.5 font-semibold text-emerald-900">
+                                      {truncateDisplay(src.value, 48)}
+                                    </span>
+                                  ) : (
+                                    '点击配置'
+                                  )}
+                                </span>
+                                <span className="shrink-0 rounded bg-slate-100 px-2 py-0.5 text-[11px] font-medium leading-none text-slate-600 group-hover:bg-teal-100 group-hover:text-teal-800">
+                                  编辑
+                                </span>
+                              </button>
+                            ) : (
+                              <button
+                                type="button"
+                                className={`group flex h-10 w-full min-w-0 items-center justify-between gap-1.5 rounded-lg border px-2 text-left text-sm transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                                  src.type === 'expr' && String(src.expr || '').trim()
+                                    ? 'border-indigo-300/90 bg-indigo-50/40 hover:border-indigo-400/90 hover:bg-indigo-50/60'
+                                    : 'border-slate-200 bg-white hover:border-indigo-300 hover:bg-indigo-50/50'
+                                }`}
+                                onClick={() => {
+                                  if (src.type !== 'expr') {
+                                    setGenericRowSource(row.id, { type: 'expr', expr: '{{}}', applyTo: 'both' });
+                                  }
+                                  setGenericConstExprForId(row.id);
+                                }}
+                                disabled={isSharedTemplate}
+                              >
+                                <span className="min-w-0 flex-1 truncate font-mono text-[12px] text-slate-800">
+                                  表达式 ·{' '}
+                                  {src.type === 'expr' ? applyToShortLabel(getConstExprApplyTo(src)) : '父行与子行'} ·{' '}
+                                  {src.type === 'expr' && String(src.expr || '').trim() ? (
+                                    <span className="rounded bg-indigo-200/80 px-1.5 py-0.5 font-semibold text-indigo-900">
+                                      {truncateDisplay(src.expr, 48)}
+                                    </span>
+                                  ) : (
+                                    '点击配置'
+                                  )}
+                                </span>
+                                <span className="shrink-0 rounded bg-slate-100 px-2 py-0.5 text-[11px] font-medium leading-none text-slate-600 group-hover:bg-teal-100 group-hover:text-teal-800">
+                                  编辑
+                                </span>
+                              </button>
+                            )}
+                          </td>
+                          <td className="w-[7.5rem] shrink-0 px-2 py-2 text-center align-middle">
+                            <div className="flex items-center justify-center gap-1.5">
+                              <button
+                                type="button"
+                                className="rounded-lg border border-slate-200 px-2 py-1.5 text-[11px] font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                                onClick={() => duplicateGenericPresetRow(row.id)}
+                                disabled={isSharedTemplate}
+                                title="复制此行（字段 key 末尾数字自动 +1）"
+                              >
+                                复制
+                              </button>
+                              <button
+                                type="button"
+                                className="rounded-lg border border-rose-200 bg-rose-50/60 px-2 py-1.5 text-[11px] font-medium text-rose-700 hover:bg-rose-100/70 disabled:opacity-50"
+                                onClick={() => removeGenericPresetRow(row.id)}
+                                disabled={isSharedTemplate}
+                                title="删除此行"
+                              >
+                                删除
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 px-4 py-3">
+              <div className="text-[11px] text-slate-500">{genericPresetLoadBusy ? '加载中…' : ' '}</div>
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-600 hover:bg-slate-100 disabled:opacity-50"
+                  onClick={addGenericPresetRow}
+                  disabled={isSharedTemplate || genericPresetLoadBusy || genericPresetSaveBusy}
+                  title="添加一行通用数据"
+                >
+                  添加一行
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg bg-teal-600 px-3 py-2 text-sm font-medium text-white hover:bg-teal-700 disabled:opacity-50"
+                  onClick={() => void onSaveGenericPresetsToServer()}
+                  disabled={isSharedTemplate || genericPresetLoadBusy || genericPresetSaveBusy}
+                >
+                  {genericPresetSaveBusy ? '保存中…' : '保存'}
+                </button>
+                <button
+                  type="button"
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                  onClick={() => closeGenericDataModal()}
+                  disabled={genericPresetSaveBusy}
+                >
+                  关闭
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       {uploadTemplateOpen ? (
         <div
@@ -2527,6 +3392,35 @@ export default function ExportMappingPage({ user }: { user: UserInfo }) {
             if (constExprEditorFor) setSourceForHeader(constExprEditorFor, next);
           }}
           onClose={() => setConstExprEditorFor(null)}
+          disabled={isSharedTemplate}
+        />
+      ) : null}
+
+      <FieldKeyModal
+        open={genericFieldPickerForId != null}
+        excelHeader={genericPickerExcelHeader}
+        value={genericFieldPickerKeyValue}
+        onPick={(key) => {
+          if (isSharedTemplate) return;
+          if (genericFieldPickerForId) setGenericRowSource(genericFieldPickerForId, { type: 'field', key });
+        }}
+        onClose={() => setGenericFieldPickerForId(null)}
+        options={genericFieldPickerOptions}
+        disabled={isSharedTemplate}
+      />
+
+      {genericConstExprEditorBundle ? (
+        <ConstExprEditorModal
+          open
+          excelHeader={
+            String(genericConstExprEditorBundle.row.excelHeader || '').trim() || '（未填写列名）'
+          }
+          source={genericConstExprEditorBundle.source}
+          onSave={(next) => {
+            if (isSharedTemplate) return;
+            if (genericConstExprForId) setGenericRowSource(genericConstExprForId, next);
+          }}
+          onClose={() => setGenericConstExprForId(null)}
           disabled={isSharedTemplate}
         />
       ) : null}

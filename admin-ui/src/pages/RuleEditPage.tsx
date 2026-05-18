@@ -34,6 +34,7 @@ export default function RuleEditPage() {
 
     pre_click_xpath: '',
     pre_click_xpaths: [],
+    scroll_to_bottom: true,
 
   });
 

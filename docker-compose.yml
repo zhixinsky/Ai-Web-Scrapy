@@ -28,9 +28,9 @@ services:
       DB_PATH: /data/data.db
       TZ: Asia/Shanghai
     volumes:
-      - scraper_data:/data
-      # 持久化：用户上传的空模板（uploads/export-templates）等
-      - scraper_uploads:/workspace/server/uploads
+      - /volume1/docker/ai-scrapy/data/backup:/data
+      # 持久化：用户上传的空模板（容器内 uploads/export-templates → 群晖宿主机 data/uploads/export-templates）
+      - /volume1/docker/ai-scrapy/data/uploads:/workspace/server/uploads
       # （可选）用宿主机目录覆盖镜像内的采集插件，无需改镜像即可更新插件
       # - ./chrome-extension:/workspace/server/chrome-extension:ro
     expose:
@@ -60,6 +60,3 @@ services:
       api:
         condition: service_healthy
 
-volumes:
-  scraper_data:
-  scraper_uploads:

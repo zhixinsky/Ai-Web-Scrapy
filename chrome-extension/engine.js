@@ -6,11 +6,62 @@
 (function () {
   if (window.__amzScraperEngineLoaded) return;
   window.__amzScraperEngineLoaded = true;
+  const SCRAPER_DEBUG = false;
+  function debugLog(...args) {
+    if (SCRAPER_DEBUG) console.log(...args);
+  }
 
   let abortRequested = false;
 
   function sleep(ms) {
     return new Promise((r) => setTimeout(r, ms));
+  }
+
+  /** 从桥接里统计 AE mtop SKU 条数：含 __aliExpressMtopSkuData 与各条抓包 normalized（避免主字段空但 responses 里有货）。 */
+  function countAeSkuListFromBridgeJson(j) {
+    if (!j || typeof j !== 'object') return 0;
+    let n = 0;
+    const m = j.__aliExpressMtopSkuData;
+    if (m && typeof m === 'object' && Array.isArray(m.skuList)) n = m.skuList.length;
+    const responses = Array.isArray(j.__jsonCapturedResponses) ? j.__jsonCapturedResponses : [];
+    for (const x of responses) {
+      const norm = x && x.normalized;
+      if (norm && typeof norm === 'object' && Array.isArray(norm.skuList)) {
+        const ln = norm.skuList.length;
+        if (ln > n) n = ln;
+      }
+    }
+    return n;
+  }
+
+  /** 轮询 DOM bridge：等 MAIN 世界 syncBridge / mtop 抓包写入 __aliExpressMtopSkuData 后再做 JSON 检测。 */
+  async function waitForAliExpressMtopBridge(dbg, maxMs = 10000, stepMs = 180) {
+    const end = Date.now() + maxMs;
+    let lastLen = -1;
+    while (Date.now() < end) {
+      if (abortRequested) return;
+      try {
+        const el = document.getElementById('__ai_sku_json_bridge__');
+        if (el && el.textContent) {
+          const j = JSON.parse(el.textContent);
+          const m = j && j.__aliExpressMtopSkuData;
+          const n = countAeSkuListFromBridgeJson(j);
+          lastLen = n;
+          const mOk = m && typeof m === 'object' && m.platform === 'aliexpress';
+          const respHasAe = Array.isArray(j.__jsonCapturedResponses)
+            ? j.__jsonCapturedResponses.some((x) => x && x.normalized && x.normalized.platform === 'aliexpress')
+            : false;
+          if (n > 0 && (mOk || respHasAe)) {
+            if (typeof dbg === 'function') dbg(`速卖通：桥接已就绪（mtop skuList=${n}）`);
+            return;
+          }
+        }
+      } catch {
+        // ignore
+      }
+      await sleep(stepMs);
+    }
+    if (typeof dbg === 'function') dbg(`速卖通：等待 mtop 桥接结束（最后 skuList 条数=${lastLen}），继续 JSON 检测`);
   }
 
   function randomIntInclusive(min, max) {
@@ -358,9 +409,14 @@
    * - 旧字段：pre_click_xpath: string
    * - 新字段：pre_click_xpaths: string[]
    */
-  async function preparePage(preClickXpathOrList) {
-    await scrollPage();
-    await interruptibleRandomSleepMs(300, 2000);
+  async function preparePage(preClickXpathOrList, options = {}) {
+    const scrollToBottom = options.scrollToBottom !== false;
+    if (scrollToBottom) {
+      await scrollPage();
+      await interruptibleRandomSleepMs(300, 2000);
+    } else {
+      await interruptibleRandomSleepMs(100, 400);
+    }
     const listRaw = Array.isArray(preClickXpathOrList)
       ? preClickXpathOrList
       : preClickXpathOrList
@@ -458,6 +514,16 @@
     if (abortRequested) throw new Error('用户已请求停止');
   }
 
+  /**
+   * 普通字段 XPath 多节点命中时拼接。若文本完全相同（页内两处重复展示同一价等），只保留一条，避免出现「$4.16 $4.16」。
+   */
+  function joinScalarFieldVals(vals) {
+    const arr = (Array.isArray(vals) ? vals : []).map((x) => String(x ?? '').trim()).filter(Boolean);
+    if (!arr.length) return '';
+    const uniq = [...new Set(arr)];
+    return uniq.length === 1 ? uniq[0] : uniq.join(' ');
+  }
+
   /** 规则是否为「颜色」变体列表（字段名或 variant_name 为 颜色） */
   function isColorVariantRule(r) {
     const f = String(r.field || '').trim();
@@ -526,9 +592,88 @@
   }
 
   /**
+   * 速卖通：首屏 query 常无完整 skuPaths，切换颜色会拉 pdp.pc.adjust。
+   * 在 JSON 检测前自动点「color_list」首项或颜色列表 XPath 首项，等价于用户手动点一次颜色。
+   */
+  async function aeTryPrimeAdjustRequest(rules, dbg) {
+    const log = typeof dbg === 'function' ? dbg : () => {};
+    const list = Array.isArray(rules) ? rules : [];
+    try {
+      const hints = ['#nav-skus', '[data-pl="sku"]', '[class*="sku-item"]', '[class*="pdp-sku"]'];
+      for (const sel of hints) {
+        const n = document.querySelector(sel);
+        if (n && n.nodeType === Node.ELEMENT_NODE) {
+          n.scrollIntoView({ block: 'center', behavior: 'instant' });
+          await sleep(220);
+          break;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    let colorListXpath = '';
+    for (const r of list) {
+      if (String(r.type || '').trim() === 'main_image' && String(r.color_list_xpath || '').trim()) {
+        colorListXpath = String(r.color_list_xpath).trim();
+        break;
+      }
+    }
+    if (!colorListXpath) {
+      for (const r of list) {
+        if (String(r.color_list_xpath || '').trim()) {
+          colorListXpath = String(r.color_list_xpath).trim();
+          break;
+        }
+      }
+    }
+    if (colorListXpath) {
+      const clickNodes = xpathAll(colorListXpath, document);
+      const first = clickNodes.find((n) => n && n.nodeType === Node.ELEMENT_NODE);
+      if (!first) {
+        log('速卖通：color_list_xpath 未命中节点，无法自动触发 adjust');
+        return;
+      }
+      try {
+        log('速卖通：为拉取完整 SKU JSON，将点击 color_list 首项（等同手动选色）');
+        first.scrollIntoView({ block: 'center', behavior: 'instant' });
+        await sleep(120);
+        first.click();
+        log('速卖通：已点击 color_list 首项，等待 adjust 约 0.8–1.5s');
+        await interruptibleRandomSleepMs(800, 1500);
+      } catch (e) {
+        log(`速卖通：color_list 首击失败（${e && e.message ? e.message : String(e)}）`);
+      }
+      return;
+    }
+    for (const r of list) {
+      if (!isColorVariantRule(r)) continue;
+      if (!(r.is_variant || String(r.type || '').trim() === 'list')) continue;
+      const xp = String(r.xpath || '').trim();
+      if (!xp) continue;
+      const nodes = xpathAll(xp, document);
+      const el = nodes.find((n) => n && n.nodeType === Node.ELEMENT_NODE);
+      if (!el) continue;
+      try {
+        log(`速卖通：为拉取完整 SKU JSON，将点击颜色列表首项（规则字段「${String(r.field || '').trim() || '颜色'}」）`);
+        el.scrollIntoView({ block: 'center', behavior: 'instant' });
+        await sleep(120);
+        el.click();
+        log('速卖通：已点击颜色列表首项，等待 adjust 约 0.8–1.5s');
+        await interruptibleRandomSleepMs(800, 1500);
+      } catch (e) {
+        log(`速卖通：颜色列表首击失败（${e && e.message ? e.message : String(e)}）`);
+      }
+      return;
+    }
+    log(
+      '速卖通：规则中未配置 color_list_xpath（主图）或「颜色」变体列表 XPath，无法自动触发 adjust；手动点一次颜色后再采集即可'
+    );
+  }
+
+  /**
    * 单页单条：先 preparePage，再按规则 XPath 顺序写入同一行对象（无变体笛卡尔积等）。
    */
-  async function scrapePlainRules(rules, _pageUrl, preClickXpath, dbg, preClickXpaths) {
+  async function scrapePlainRules(rules, _pageUrl, preClickXpath, dbg, preClickXpaths, scrollToBottom = true) {
     const doc = document;
     const log = typeof dbg === 'function' ? dbg : () => {};
     const list = Array.isArray(rules) ? rules : [];
@@ -539,8 +684,10 @@
       : [];
     const legacy = String(preClickXpath || '').trim();
     if (legacy && !preList.includes(legacy)) preList.push(legacy);
-    log(`准备页面：滚动/等待，预处理步数=${preList.length}`);
-    await preparePage(preList);
+    log(
+      `准备页面：${scrollToBottom !== false ? '已启用滚底' : '已跳过滚底'}，预处理步数=${preList.length}`
+    );
+    await preparePage(preList, { scrollToBottom: scrollToBottom !== false });
     log(`规则数=${list.length}（按 XPath/ShadowCSS 取值）`);
 
     for (let idx = 0; idx < list.length; idx++) {
@@ -642,13 +789,267 @@
 
       // field / table / 其它：文本拼接为一条字符串
       const vals = cssExpr ? await extractCssTextOrAttr(cssExpr, false) : extractTextOrAttr(doc, xpath, false);
-      row[field] = vals.length ? vals.join(' ') : '';
+      row[field] = joinScalarFieldVals(vals);
       log(`「${field}」字段 命中 ${vals.length}`);
       if (cssExpr && vals.length === 0) log(`  · ShadowCSS 诊断：${shadowCssExplainZero(cssExpr)}`);
     }
 
     checkAbort();
     return [row];
+  }
+
+  /** JSON SKU 成功后补采商品基础信息：跳过变体列表与主图点击，避免 JSON SKU 被 XPath 旧结构覆盖。 */
+  async function scrapeBaseProductRules(rules, preClickXpath, dbg, preClickXpaths, scrollToBottom = true) {
+    const doc = document;
+    const log = typeof dbg === 'function' ? dbg : () => {};
+    const list = Array.isArray(rules) ? rules : [];
+    const row = {};
+    const preList = Array.isArray(preClickXpaths)
+      ? preClickXpaths.map((x) => String(x || '').trim()).filter(Boolean)
+      : [];
+    const legacy = String(preClickXpath || '').trim();
+    if (legacy && !preList.includes(legacy)) preList.push(legacy);
+    log(
+      `JSON合并：补采基础商品字段，${scrollToBottom !== false ? '含滚底' : '跳过滚底'}，预处理步数=${preList.length}`
+    );
+    await preparePage(preList, { scrollToBottom: scrollToBottom !== false });
+
+    for (let idx = 0; idx < list.length; idx++) {
+      checkAbort();
+      const r = list[idx];
+      const xpath = String(r.xpath || '').trim();
+      if (!xpath) continue;
+      const field = String(r.field || `字段_${idx + 1}`).trim() || `字段_${idx + 1}`;
+      const type = String(r.type || 'field');
+      const isVariant = Boolean(r.is_variant);
+      const isMainImg = type === 'main_image';
+      if (isVariant || isMainImg || field === '颜色' || field === '尺码' || field === '尺寸' || field === '主图') {
+        continue;
+      }
+      const cssExpr = parseCssExpr(xpath);
+      const isGalImg = type === 'gallery_image';
+      const isDesc = type === 'description';
+      const isDetail = type === 'detail';
+      if (isGalImg) {
+        row[field] = cssExpr ? await extractCssTextOrAttr(cssExpr, true) : extractTextOrAttr(doc, xpath, true);
+        continue;
+      }
+      if (isDesc) {
+        row[field] = cssExpr ? await extractCssTextOrAttr(cssExpr, false) : extractTextOrAttr(doc, xpath, false);
+        continue;
+      }
+      if (isDetail) {
+        const vals = cssExpr ? await extractCssTextOrAttr(cssExpr, false) : extractTextOrAttr(doc, xpath, false);
+        row[field] = vals.join('|');
+        const vx = String(r.value_xpath || '').trim();
+        if (vx) {
+          const vvCss = parseCssExpr(vx);
+          const vv = vvCss ? await extractCssTextOrAttr(vvCss, false) : extractTextOrAttr(doc, vx, false);
+          const mergedDetail = buildDetailHtmlFromNameValueLists(vals, vv);
+          if (mergedDetail) {
+            row[field] = mergedDetail;
+          } else {
+            row[`${field}_value_xpath`] = vv.join('|');
+          }
+        }
+        continue;
+      }
+      const vals = cssExpr ? await extractCssTextOrAttr(cssExpr, false) : extractTextOrAttr(doc, xpath, false);
+      row[field] = joinScalarFieldVals(vals);
+    }
+    return row;
+  }
+
+  function uniqueNonEmpty(list) {
+    const out = [];
+    for (const x of Array.isArray(list) ? list : []) {
+      const s = String(x ?? '').trim();
+      if (s && !out.includes(s)) out.push(s);
+    }
+    return out;
+  }
+
+  function shouldDropDetailName(nameRaw) {
+    const k = String(nameRaw || '').trim();
+    if (!k) return true;
+    const low = k.toLowerCase().replace(/\s+/g, ' ');
+    const dropEn = new Set([
+      'brand name',
+      'brand',
+      'origin',
+      'place of origin',
+      'country of origin',
+      'product origin',
+      'made in',
+      'madein',
+      'cn',
+      'size',
+      'sizes',
+      'country',
+      'platforms',
+      'main downstream platforms',
+      'color',
+      'in stock',
+      'stock type',
+      'suitable for',
+      'error range',
+      'item no',
+      'article number',
+    ]);
+    if (dropEn.has(low)) return true;
+    if (low.startsWith('size') || low.startsWith('brand')) return true;
+    const dropCnSubstrings = [
+      '品牌',
+      '尺码',
+      '跨境',
+      '质检',
+      '货源',
+      '货号',
+      '颜色',
+      '平台',
+      '年份',
+      '季节',
+      '淘货',
+      '销售',
+      '地区',
+      '库存',
+      '授权',
+      '专供',
+      '设计货源',
+      '报告',
+      '误差',
+      '上市',
+      '吊牌',
+      '领标',
+      '衣长',
+    ];
+    return dropCnSubstrings.some((sub) => k.includes(sub));
+  }
+
+  function buildDetailHtmlFromNameValueLists(namesRaw, valuesRaw) {
+    const names = Array.isArray(namesRaw) ? namesRaw : String(namesRaw || '').split('|');
+    const values = Array.isArray(valuesRaw) ? valuesRaw : String(valuesRaw || '').split('|');
+    const n = Math.min(names.length, values.length);
+    const parts = [];
+    for (let i = 0; i < n; i++) {
+      const name = String(names[i] ?? '').trim();
+      const value = String(values[i] ?? '').trim();
+      if (shouldDropDetailName(name) || !value) continue;
+      parts.push(`${name}: ${value}`);
+    }
+    return parts.join('<br>');
+  }
+
+  function mergeBaseProductAndJsonSku(baseProduct, jsonRows, skuAxes, legacyMeta) {
+    const base = baseProduct && typeof baseProduct === 'object' && !Array.isArray(baseProduct) ? { ...baseProduct } : {};
+    const children = (Array.isArray(jsonRows) ? jsonRows : [])
+      .filter((r) => r && r['父子关系'] === 'child')
+      .map((r) => ({ ...r, 价格: '' }));
+    const colors = uniqueNonEmpty(
+      legacyMeta && Array.isArray(legacyMeta.colors)
+        ? legacyMeta.colors
+        : skuAxes && Array.isArray(skuAxes.colors)
+          ? skuAxes.colors
+          : children.map((r) => r['颜色'])
+    );
+    const sizes = uniqueNonEmpty(
+      legacyMeta && Array.isArray(legacyMeta.sizes)
+        ? legacyMeta.sizes
+        : skuAxes && Array.isArray(skuAxes.sizes)
+          ? skuAxes.sizes
+          : children.map((r) => r['尺码'] ?? r['尺寸'])
+    );
+    const mains = [];
+    const byColor = new Map();
+    children.forEach((r) => {
+      const c = String(r['颜色'] ?? '').trim();
+      const m = String(r['主图'] ?? '').trim();
+      if (c && m && !byColor.has(c)) byColor.set(c, m);
+    });
+    colors.forEach((c, i) => {
+      const m =
+        String(
+          (legacyMeta && Array.isArray(legacyMeta.mains)
+            ? legacyMeta.mains[i]
+            : skuAxes && Array.isArray(skuAxes.mains)
+              ? skuAxes.mains[i]
+              : '') || ''
+        ).trim() ||
+        String(byColor.get(c) || '').trim();
+      if (m) mains.push(m);
+    });
+    const mainImages = mains;
+    const finalRow = {
+      ...base,
+      颜色: colors.length > 0 ? colors : (Array.isArray(base['颜色']) ? base['颜色'] : []),
+      尺码: sizes.length > 0 ? sizes : (Array.isArray(base['尺码']) ? base['尺码'] : []),
+      主图: mainImages.length > 0 ? mainImages : (Array.isArray(base['主图']) ? base['主图'] : []),
+      价格: base['价格'] || '',
+    };
+    const productView = {
+      标题: finalRow['标题'] || '',
+      颜色: finalRow['颜色'] || [],
+      尺码: finalRow['尺码'] || [],
+      主图: finalRow['主图'] || [],
+      副图: finalRow['副图'] || [],
+      详情: finalRow['详情'] || '',
+      价格: finalRow['价格'] || '',
+      详情图: finalRow['详情图'] || [],
+    };
+    try {
+      debugLog('[1688 SKU] colors:', colors);
+      debugLog('[MAIN IMAGES]', mainImages);
+      debugLog('[FINAL ROW 主图]', finalRow['主图']);
+    } catch {
+      // ignore
+    }
+    const parent = {
+      父子关系: 'parent',
+      标题: base['标题'] || '',
+      价格: base['价格'] || '',
+      副图: base['副图'] || [],
+      详情: base['详情'] || '',
+      ...(base['详情_value_xpath'] != null ? { 详情_value_xpath: base['详情_value_xpath'] } : {}),
+      详情图: base['详情图'] || [],
+      basePrice: base['价格'] || '',
+    };
+    const skuView = [parent, ...children];
+    return { productView, skuView };
+  }
+
+  /**
+   * 速卖通 legacy JSON 与 XPath 单行上报结构对齐：相同字段名、类型（数组/字符串）、书写顺序。
+   */
+  function coerceStringArray(v) {
+    if (Array.isArray(v)) return v.map((x) => String(x ?? '').trim()).filter(Boolean);
+    if (v == null || v === '') return [];
+    const s = String(v).trim();
+    return s ? [s] : [];
+  }
+  function coerceStr(v, fb = '') {
+    return String(v != null && v !== '' ? v : fb).trim();
+  }
+  function buildAliExpressLegacyJsonProductView(baseProduct, jsonRow) {
+    const b = baseProduct && typeof baseProduct === 'object' && !Array.isArray(baseProduct) ? baseProduct : {};
+    const j = jsonRow && typeof jsonRow === 'object' && !Array.isArray(jsonRow) ? jsonRow : {};
+    const pickArr = (primary, secondary) => {
+      if (Array.isArray(primary) && primary.length) return primary;
+      if (Array.isArray(secondary) && secondary.length) return secondary;
+      return coerceStringArray(primary ?? secondary);
+    };
+    const out = {
+      标题: coerceStr(b['标题'] || j['标题']),
+      颜色: pickArr(j['颜色'], b['颜色']),
+      尺码: pickArr(j['尺码'], b['尺码']),
+      主图: pickArr(j['主图'], b['主图']),
+      副图: pickArr(b['副图'], j['副图']),
+      描述: pickArr(b['描述'], j['描述']),
+      详情: coerceStr(b['详情'] || j['详情']),
+      详情图: pickArr(b['详情图'], j['详情图']),
+      价格: coerceStr(b['价格']),
+    };
+    if (b['详情_value_xpath'] != null) out['详情_value_xpath'] = b['详情_value_xpath'];
+    return out;
   }
 
   const PLATFORM_ALIEXPRESS = 'aliexpress';
@@ -694,11 +1095,11 @@
     return PLATFORM_SCRAPERS;
   }
 
-  async function dispatchScrapeByPlatform(platformKey, rules, pageUrl, preClickXpath, dbg, preClickXpaths) {
+  async function dispatchScrapeByPlatform(platformKey, rules, pageUrl, preClickXpath, dbg, preClickXpaths, scrollToBottom = true) {
     const scrapers = getPlatformScrapers();
     const fn = scrapers[platformKey];
     if (typeof fn !== 'function') throw new Error('采集管线未注册：' + platformKey);
-    return fn(rules, pageUrl, preClickXpath, dbg, preClickXpaths);
+    return fn(rules, pageUrl, preClickXpath, dbg, preClickXpaths, scrollToBottom);
   }
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -715,15 +1116,157 @@
           const pre = msg.pre_click_xpath || '';
           const preList = Array.isArray(msg.pre_click_xpaths) ? msg.pre_click_xpaths : [];
           const url = msg.url || location.href;
-          const platformKey = resolvePlatformKey(msg.platform);
+          const mode = String(msg.scrapeMode || 'xpath').trim().toLowerCase();
+          const scrollToBottom = msg.scroll_to_bottom !== false;
+          let platformKey = '';
+          let platformResolveError = null;
+          try {
+            platformKey = resolvePlatformKey(msg.platform);
+          } catch (e) {
+            platformResolveError = e;
+            platformKey = String(msg.platform || 'json').trim() || 'json';
+          }
           const debugLogs = [];
           const dbg = (m) => {
             if (debugLogs.length > 500) return;
             debugLogs.push(String(m));
           };
+          /** @type {string[]} */
+          let jsonAttemptLines = [];
+          const safeJson = (obj) => {
+            try {
+              return JSON.stringify(obj, (_k, v) => (typeof v === 'bigint' ? String(v) : v));
+            } catch {
+              try {
+                return String(obj);
+              } catch {
+                return '[unstringifiable]';
+              }
+            }
+          };
           dbg(`平台=${platformKey}`);
-          const rows = await dispatchScrapeByPlatform(platformKey, rules, url, pre, dbg, preList);
-          sendResponse({ ok: true, rows, platformKey, logs: debugLogs });
+          if (platformResolveError && mode === 'xpath') throw platformResolveError;
+          const isAliExpressPage =
+            platformKey === PLATFORM_ALIEXPRESS || String(location.host || '').toLowerCase().includes('aliexpress');
+          if (isAliExpressPage && (mode === 'json' || mode === 'smart')) {
+            dbg('速卖通：尝试 SKU JSON 识别，失败后转入模拟采集');
+          }
+          /** 速卖通：在「点首色拉 adjust」之前快照基础 XPath（含价格），避免合并时页面已是 SKU 价与纯 XPath 模拟采集不一致 */
+          let aeBaseProductBeforeColorPrime = null;
+          if (mode === 'json' || mode === 'smart') {
+            if (isAliExpressPage) {
+              try {
+                dbg('速卖通：选色触发 adjust 前先补采基础字段（含价格），与未切换 SKU 时 XPath 一致');
+                aeBaseProductBeforeColorPrime = await scrapeBaseProductRules(rules, pre, dbg, preList, scrollToBottom);
+              } catch (e) {
+                dbg(`速卖通：选色前补采失败（合并时将再试）：${e && e.message ? e.message : String(e)}`);
+              }
+              await aeTryPrimeAdjustRequest(rules, dbg);
+              dbg('速卖通：等待 mtop 数据同步到采集桥接（首次最长约 10s）…');
+              await waitForAliExpressMtopBridge(dbg, 10000, 180);
+            }
+            const jsonDetect = window.__skuJsonDetect && window.__skuJsonDetect.detect;
+            if (typeof jsonDetect === 'function') {
+              const rulesForJson = Array.isArray(msg.skuDetectRules) ? msg.skuDetectRules : [];
+              let got = jsonDetect(rulesForJson, msg.platform);
+              const mergeJsonAttempts = (g) => {
+                try {
+                  const atts = g && Array.isArray(g.attempts) ? g.attempts : [];
+                  const lines = atts.slice(0, 120).map((a) => `JSON尝试：${safeJson(a)}`);
+                  if (atts.length > 120) lines.push(`JSON尝试：… 还有 ${atts.length - 120} 条`);
+                  return lines;
+                } catch {
+                  return [];
+                }
+              };
+              jsonAttemptLines = mergeJsonAttempts(got);
+              if (
+                isAliExpressPage &&
+                (!got || !got.ok) &&
+                (mode === 'smart' || mode === 'json')
+              ) {
+                dbg('速卖通：首检 JSON 未命中，等待 2.8s 后重试（首包 query/adjust 常晚于首屏）');
+                await sleep(2800);
+                await waitForAliExpressMtopBridge(dbg, 6500, 160);
+                const got2 = jsonDetect(rulesForJson, msg.platform);
+                const lines2 = mergeJsonAttempts(got2);
+                if (lines2.length) {
+                  jsonAttemptLines = jsonAttemptLines.concat(['JSON尝试：[速卖通二次检测]'].concat(lines2)).slice(0, 200);
+                }
+                if (got2 && got2.ok) got = got2;
+              }
+              if (got && got.ok && Array.isArray(got.rows) && got.rows.length > 0 && (got.legacyProductRows || got.rows.length > 1)) {
+                const baseProduct =
+                  aeBaseProductBeforeColorPrime && typeof aeBaseProductBeforeColorPrime === 'object'
+                    ? aeBaseProductBeforeColorPrime
+                    : await scrapeBaseProductRules(rules, pre, dbg, preList, scrollToBottom);
+                let productView = null;
+                if (got.legacyProductRows) {
+                  const jsonRow = got.rows[0] && typeof got.rows[0] === 'object' ? got.rows[0] : {};
+                  try {
+                    productView = buildAliExpressLegacyJsonProductView(baseProduct, jsonRow);
+                  } catch (e) {
+                    dbg(`JSON合并异常（已降级为浅合并）：${e && e.message ? e.message : String(e)}`);
+                    const b0 = baseProduct && typeof baseProduct === 'object' && !Array.isArray(baseProduct) ? baseProduct : {};
+                    productView = { ...b0, ...jsonRow, 价格: b0['价格'] || '' };
+                  }
+                } else {
+                  const merged = mergeBaseProductAndJsonSku(baseProduct, got.rows, got.sku_axes || null, got.legacyProductMeta || null);
+                  productView = merged.productView;
+                }
+                dbg(
+                  `JSON采集成功：规则=${got.ruleName || '—'}，来源=${got.source || '—'}，路径=${got.path || '—'}，SKU=${got.rawCount || Math.max(0, got.rows.length - 1)}`
+                );
+                dbg('JSON合并：标题/副图/详情/详情图/价格来自 XPath；颜色/尺码/主图/SKU 来自 JSON（JSON 不含价）');
+                const aeSku = got.aliexpressSkuData;
+                const aeDbg = aeSku && aeSku._debug;
+                if (aeDbg) {
+                  dbg('[AE SKU] 命中 mtop AliExpress PDP（query/adjust 等）：是');
+                  dbg(`[AE SKU] JSONP 解析成功：${aeDbg.jsonpParsed !== false ? '是' : '否'}`);
+                  dbg(`[AE SKU] 提取 skuId 数量：${Number(aeDbg.skuIdCount) || 0}`);
+                  dbg(`[AE SKU] 是否提取到 skuImagesMap：${aeDbg.hasSkuImagesMap ? '是' : '否'}`);
+                  dbg(`[AE SKU] 是否提取到 skuPriceList：${aeDbg.hasSkuPriceList ? '是' : '否'}`);
+                  dbg(`[AE SKU] 是否提取到 skuPropertyList：${aeDbg.hasSkuPropertyList ? '是' : '否'}`);
+                }
+                sendResponse({
+                  ok: true,
+                  rows: [productView],
+                  ...(got.aliexpressSkuData ? { aliexpressSkuData: got.aliexpressSkuData } : {}),
+                  platformKey,
+                  scrapeMode: 'json',
+                  logs: debugLogs.concat(jsonAttemptLines),
+                });
+                return;
+              }
+              dbg(`JSON采集失败：${got && got.error ? got.error : '未命中'}`);
+              // 智能采集降级到 xpath 时也保留 JSON attempts，方便定位为何未命中数据源
+              for (const line of jsonAttemptLines) dbg(line);
+              if (mode === 'json') {
+                sendResponse({
+                  ok: false,
+                  error: got && got.error ? got.error : 'JSON 采集未识别到 SKU 数据',
+                  platformKey,
+                  scrapeMode: 'json',
+                  logs: debugLogs.concat(jsonAttemptLines),
+                });
+                return;
+              }
+              if (platformResolveError) throw platformResolveError;
+              dbg('智能采集：转入模拟 XPath/点击兜底');
+            } else if (mode === 'json') {
+              sendResponse({ ok: false, error: 'JSON 识别引擎未加载', platformKey, scrapeMode: 'json', logs: debugLogs });
+              return;
+            }
+          }
+          if (platformResolveError) throw platformResolveError;
+          const rows = await dispatchScrapeByPlatform(platformKey, rules, url, pre, dbg, preList, scrollToBottom);
+          sendResponse({
+            ok: true,
+            rows,
+            platformKey,
+            scrapeMode: mode === 'smart' ? 'xpath-fallback' : 'xpath',
+            logs: debugLogs.concat(mode === 'smart' ? jsonAttemptLines : []),
+          });
         } catch (e) {
           sendResponse({ ok: false, error: e.message || String(e) });
         }

@@ -90,6 +90,7 @@ import {
   assertOssConfigured,
   buildOssPublicUrl,
   collectionUsesOss,
+  copyOssObjectsForCollection,
   deleteOssObjectsForCollection,
   getOssConfig,
   newOssClient,
@@ -102,9 +103,98 @@ import STS from '@alicloud/sts-sdk';
 import { randomUUID } from 'node:crypto';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'url';
+import {
+  detectSkuFromSources,
+  matchSkuDetectRules,
+  normalizeSkuDetectRule,
+} from './skuDetectEngine.js';
 
 /** app_settings 键：导出列映射草稿（与 GET /api/export/column-map-draft 一致） */
 const EXPORT_COLUMN_MAP_DRAFT_KEY_PREFIX = 'export_column_map_draft:';
+
+/** app_settings 键：每用户的「通用数据」预设（用于导出映射快速填充；全模板共享） */
+const EXPORT_GENERIC_PRESET_KEY_PREFIX = 'export_generic_preset:v1:';
+
+function exportGenericPresetUserKey(uid) {
+  return `${EXPORT_GENERIC_PRESET_KEY_PREFIX}user:${uid}`;
+}
+
+function parseExportGenericPresetRows(raw) {
+  if (raw == null || raw === '') return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/** 读取用户级通用数据；若仅有旧版「按模板」key 则取行数最多的一份并迁移到用户级 */
+function getExportGenericPresetRowsForUser(uid) {
+  const userKey = exportGenericPresetUserKey(uid);
+  const userRows = parseExportGenericPresetRows(getAppSetting(userKey));
+  if (userRows.length > 0) return userRows;
+
+  const legacyPrefix = `${EXPORT_GENERIC_PRESET_KEY_PREFIX}user:${uid}:exportType:`;
+  const legacy = db.prepare('SELECT value FROM app_settings WHERE key LIKE ?').all(`${legacyPrefix}%`);
+  let best = [];
+  for (const r of legacy) {
+    const arr = parseExportGenericPresetRows(r?.value);
+    if (arr.length > best.length) best = arr;
+  }
+  if (best.length > 0) {
+    setAppSetting(userKey, JSON.stringify(best));
+  }
+  return best;
+}
+
+function normalizeExportGenericPresetRows(rowsIn) {
+  const rows = [];
+  for (const r of rowsIn) {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const excelHeader = String(r.excelHeader || '').trim();
+    if (!excelHeader) continue;
+    if (excelHeader.length > 600) {
+      const err = new Error('模板列名过长（>600）');
+      err.status = 400;
+      throw err;
+    }
+    const source = r.source;
+    if (!source || typeof source !== 'object' || Array.isArray(source)) continue;
+    const t = String(source.type || '').trim();
+    if (t !== 'field' && t !== 'const' && t !== 'expr') continue;
+    if (t === 'field') {
+      const key = String(source.key || '').trim();
+      if (!key) continue;
+      rows.push({ excelHeader, source: { type: 'field', key } });
+      continue;
+    }
+    if (t === 'const') {
+      const value = source.value == null ? '' : String(source.value);
+      const applyTo = String(source.applyTo || '').trim();
+      rows.push({
+        excelHeader,
+        source: { type: 'const', value, ...(applyTo ? { applyTo } : {}) },
+      });
+      continue;
+    }
+    if (t === 'expr') {
+      const expr = String(source.expr || '').trim();
+      if (!expr) continue;
+      if (expr.length > 800) {
+        const err = new Error('表达式过长（>800）');
+        err.status = 400;
+        throw err;
+      }
+      const applyTo = String(source.applyTo || '').trim();
+      rows.push({
+        excelHeader,
+        source: { type: 'expr', expr, ...(applyTo ? { applyTo } : {}) },
+      });
+    }
+  }
+  return rows;
+}
 
 /** 上传的自定义空模板存放目录（服务器磁盘） */
 const EXPORT_TEMPLATE_UPLOAD_DIR = path.join(process.cwd(), 'uploads', 'export-templates');
@@ -115,8 +205,28 @@ function normalizeHeaderCellText(v) {
     .trim();
 }
 
+function normalizePossiblyMojibakeFilenameText(name) {
+  const raw = String(name ?? '').trim();
+  if (!raw) return '';
+  // Some multipart clients/proxies expose UTF-8 filenames as Latin1-looking mojibake,
+  // e.g. "è¡¬è¡«æ¨¡æ¿" instead of "衬衫模板". Decode only when it clearly improves to CJK.
+  if (!/[ÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿ]/.test(raw)) {
+    return raw;
+  }
+  try {
+    const decoded = Buffer.from(raw, 'latin1').toString('utf8').trim();
+    const rawCjk = (raw.match(/[\u3400-\u9FFF]/g) || []).length;
+    const decodedCjk = (decoded.match(/[\u3400-\u9FFF]/g) || []).length;
+    const replacementCount = (decoded.match(/\uFFFD/g) || []).length;
+    if (decoded && replacementCount === 0 && decodedCjk > rawCjk) return decoded;
+  } catch {
+    // keep raw
+  }
+  return raw;
+}
+
 function safeExcelFilenameBase(name) {
-  const base = String(name ?? '').trim() || 'template';
+  const base = normalizePossiblyMojibakeFilenameText(name) || 'template';
   // 保守过滤：避免路径穿越/奇怪字符
   const cleaned = base
     .replace(/[\\/:*?"<>|\u0000-\u001F]/g, '_')
@@ -202,6 +312,24 @@ function getCustomExportTemplateByExportTypeId(exportTypeId) {
     dataStartRow: row.dataStartRow,
     headers,
   };
+}
+
+/**
+ * 与上传空模板后缀一致：优先磁盘路径扩展名，其次 originalFilename（仅识别 .xlsx / .xlsm）。
+ * @param {{ filePath?: string, originalFilename?: string } | null | undefined} tpl
+ * @returns {'xlsx' | 'xlsm'}
+ */
+function exportTemplateWorkbookExtension(tpl) {
+  if (!tpl) return 'xlsx';
+  const fp = String(tpl.filePath || '').trim();
+  const extFile = path.extname(path.basename(fp)).toLowerCase();
+  if (extFile === '.xlsm') return 'xlsm';
+  if (extFile === '.xlsx') return 'xlsx';
+  const orig = String(tpl.originalFilename || '').trim();
+  const extOrig = path.extname(orig).toLowerCase();
+  if (extOrig === '.xlsm') return 'xlsm';
+  if (extOrig === '.xlsx') return 'xlsx';
+  return 'xlsx';
 }
 
 /** 按主键 id 读取上传模板（用于下载等场景） */
@@ -299,7 +427,7 @@ const uploadExportTemplate = multer({
     },
     filename: (req, file, cb) => {
       const base = safeExcelFilenameBase(req.body?.name || file.originalname || 'template');
-      const ext = path.extname(file.originalname || '').toLowerCase();
+      const ext = path.extname(normalizePossiblyMojibakeFilenameText(file.originalname) || '').toLowerCase();
       const useExt = ext === '.xlsx' || ext === '.xlsm' ? ext : '.xlsx';
       const stamp = Date.now();
       cb(null, `${base}-${stamp}${useExt}`);
@@ -500,7 +628,13 @@ async function runImageWorker() {
       );
       resetImageDownloadRetryState(job.collectionId);
       notifyCollectionChangedById(job.collectionId, 'images-done');
-      if (isPixianConfigured() && ((dl.mainFiles || []).length || (dl.galleryFiles || []).length)) {
+      const ownerRow = db.prepare('SELECT user_id FROM collections WHERE id = ?').get(job.collectionId);
+      const ownerId = Number(ownerRow?.user_id);
+      if (
+        isPixianConfigured() &&
+        ((dl.mainFiles || []).length || (dl.galleryFiles || []).length) &&
+        userWantsCollectionAutoNobg(ownerId)
+      ) {
         enqueueNobgAfterDownload(job.collectionId, { onlyMain: false });
       }
     } catch (e) {
@@ -746,6 +880,16 @@ function resumePendingCollectionAiJobs() {
     return;
   }
   for (const r of rows) enqueueCollectionAiPostProcess(Number(r.id));
+}
+
+/** 采集主副图下载完成后是否自动去背景（个人信息默认开启，可关闭） */
+function userWantsCollectionAutoNobg(userId) {
+  const uid = Number(userId);
+  if (!Number.isFinite(uid) || uid <= 0) return true;
+  const row = db
+    .prepare('SELECT COALESCE(collection_auto_nobg, 1) AS v FROM users WHERE id = ?')
+    .get(uid);
+  return Number(row?.v) !== 0;
 }
 
 /** 下载完成后自动去背景：主图+副图（onlyMain=false）；未配置 Pixian 或无图片则不入队 */
@@ -1615,7 +1759,7 @@ app.post(
           name,
           exportTypeId,
           destPlatformId,
-          String(req.file.originalname || ''),
+          normalizePossiblyMojibakeFilenameText(req.file.originalname || ''),
           toStoredExportTemplatePath(req.file.path),
           sheetName,
           Math.floor(headerRow),
@@ -1648,7 +1792,7 @@ app.post(
           headerRow: Math.floor(headerRow),
           dataStartRow: Math.floor(dataStartRow),
           headers,
-          originalFilename: String(req.file.originalname || ''),
+          originalFilename: normalizePossiblyMojibakeFilenameText(req.file.originalname || ''),
           createdByUserId: req.user?.sub ?? null,
           isPublic: isPublic ? 1 : 0,
           createdAt: now,
@@ -2018,6 +2162,9 @@ app.patch(
       const body = req.body && typeof req.body === 'object' ? req.body : {};
       const nameRaw = body.name;
       const name = nameRaw == null ? '' : String(nameRaw).trim();
+      const hasSheetName = Object.prototype.hasOwnProperty.call(body, 'sheetName');
+      const hasHeaderRow = Object.prototype.hasOwnProperty.call(body, 'headerRow');
+      const hasDataStartRow = Object.prototype.hasOwnProperty.call(body, 'dataStartRow');
       const isPublicRaw = body.isPublic;
       const isPublic =
         String(isPublicRaw ?? '')
@@ -2028,7 +2175,16 @@ app.patch(
           .toLowerCase() === 'true';
 
       const row = db
-        .prepare(`SELECT created_by_user_id AS createdByUserId FROM export_templates WHERE id = ?`)
+        .prepare(
+          `SELECT file_path AS filePath,
+                  created_by_user_id AS createdByUserId,
+                  headers_json AS headersJson,
+                  sheet_name AS sheetName,
+                  header_row AS headerRow,
+                  data_start_row AS dataStartRow
+             FROM export_templates
+            WHERE id = ?`
+        )
         .get(id);
       if (!row) {
         res.status(404).json({ error: '模板不存在' });
@@ -2064,7 +2220,75 @@ app.patch(
           id
         );
       }
-      res.json({ ok: true, isPublic: isPublic ? 1 : 0, updatedAt: now });
+      let templateMeta = null;
+      if (hasSheetName || hasHeaderRow || hasDataStartRow) {
+        const sheetName = hasSheetName ? String(body.sheetName || '').trim() : String(row.sheetName || '').trim();
+        const headerRow = Math.floor(Number(hasHeaderRow ? body.headerRow : row.headerRow));
+        const dataStartRow = Math.floor(Number(hasDataStartRow ? body.dataStartRow : row.dataStartRow));
+        if (!sheetName) {
+          res.status(400).json({ error: 'sheetName 不能为空' });
+          return;
+        }
+        if (!Number.isFinite(headerRow) || headerRow < 1 || headerRow > 5000) {
+          res.status(400).json({ error: '表头行 headerRow 无效（需为 >=1 的数字）' });
+          return;
+        }
+        if (!Number.isFinite(dataStartRow) || dataStartRow < 1 || dataStartRow > 5000) {
+          res.status(400).json({ error: '数据填充起始行 dataStartRow 无效（需为 >=1 的数字）' });
+          return;
+        }
+        if (dataStartRow <= headerRow) {
+          res.status(400).json({ error: 'dataStartRow 必须大于 headerRow' });
+          return;
+        }
+
+        const full = getExportTemplateByPrimaryId(id);
+        if (!full) {
+          res.status(404).json({ error: '模板不存在' });
+          return;
+        }
+        const mat = materializeExportTemplateFileIfMissing(full);
+        if (!mat.ok) {
+          res.status(404).json({ error: mat.error || '模板文件缺失（服务器未找到文件）' });
+          return;
+        }
+        let wb = null;
+        try {
+          wb = XLSX.readFile(mat.filePath, { cellDates: false });
+        } catch (e) {
+          res.status(400).json({ error: e instanceof Error ? e.message : '读取 Excel 失败' });
+          return;
+        }
+        const sheet = wb.Sheets && wb.Sheets[sheetName];
+        if (!sheet) {
+          res.status(400).json({ error: `未找到工作表「${sheetName}」，请检查 sheetName` });
+          return;
+        }
+        const rows = XLSX.utils.sheet_to_json(sheet, {
+          header: 1,
+          range: Math.max(0, headerRow - 1),
+          blankrows: false,
+          defval: '',
+        });
+        const headerArr = Array.isArray(rows) && Array.isArray(rows[0]) ? rows[0] : [];
+        const headers = headerArr.map((v) => normalizeHeaderCellText(v));
+        const nonEmptyCount = headers.filter((x) => String(x).trim() !== '').length;
+        if (headers.length === 0 || nonEmptyCount === 0) {
+          res.status(400).json({ error: `在第 ${headerRow} 行未解析到任何列名，请核对表头行` });
+          return;
+        }
+        if (headers.length > 5000) {
+          res.status(400).json({ error: '列数过多（>5000），请检查模板是否正确' });
+          return;
+        }
+        db.prepare(
+          `UPDATE export_templates
+              SET sheet_name = ?, header_row = ?, data_start_row = ?, headers_json = ?, updated_at = ?
+            WHERE id = ?`
+        ).run(sheetName, headerRow, dataStartRow, JSON.stringify(headers), now, id);
+        templateMeta = { id, sheetName, headerRow, dataStartRow, headers };
+      }
+      res.json({ ok: true, isPublic: isPublic ? 1 : 0, updatedAt: now, ...(templateMeta ? { template: templateMeta } : {}) });
     } catch (e) {
       res.status(500).json({ error: e instanceof Error ? e.message : '更新模板失败' });
     }
@@ -2211,7 +2435,9 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 app.get('/api/auth/me', authMiddleware, (req, res) => {
-  const u = db.prepare('SELECT default_export_platform_id FROM users WHERE id = ?').get(req.user.sub);
+  const u = db
+    .prepare('SELECT default_export_platform_id, COALESCE(collection_auto_nobg, 1) AS collection_auto_nobg FROM users WHERE id = ?')
+    .get(req.user.sub);
   res.json({
     id: req.user.sub,
     username: req.user.username,
@@ -2221,6 +2447,7 @@ app.get('/api/auth/me', authMiddleware, (req, res) => {
     allowedModules: req.user.allowedModules,
     planId: req.user.planId,
     defaultExportPlatformId: String(u?.default_export_platform_id || '').trim(),
+    collectionAutoNobg: Number(u?.collection_auto_nobg) !== 0,
   });
 });
 
@@ -2264,6 +2491,7 @@ app.get('/api/account/overview', authMiddleware, (req, res) => {
       allowedModules: req.user.allowedModules,
       planId: req.user.planId,
       defaultExportPlatformId: String(u?.default_export_platform_id || '').trim(),
+      collectionAutoNobg: Number(u?.collection_auto_nobg ?? 1) !== 0,
     },
     credits,
     planCatalog: Object.values(MEMBERSHIP_PLANS).map((p) => ({
@@ -2294,6 +2522,20 @@ app.put('/api/account/default-export-platform', authMiddleware, (req, res) => {
   }
   db.prepare('UPDATE users SET default_export_platform_id = ? WHERE id = ?').run(next, req.user.sub);
   res.json({ ok: true, defaultExportPlatformId: next });
+});
+
+/** 个人中心：采集入库后是否自动去背景（关闭则仅保留原图，可之后在图片资源里手动去背景） */
+app.put('/api/account/collection-auto-nobg', authMiddleware, (req, res) => {
+  const u = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
+  if (!u || !isUserValid(u)) {
+    res.status(403).json({ error: '账号不在有效授权期内' });
+    return;
+  }
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const enabled = body.enabled === true || String(body.enabled || '').trim() === '1';
+  const val = enabled ? 1 : 0;
+  db.prepare('UPDATE users SET collection_auto_nobg = ? WHERE id = ?').run(val, req.user.sub);
+  res.json({ ok: true, collectionAutoNobg: enabled });
 });
 
 app.post('/api/account/change-password', authMiddleware, (req, res) => {
@@ -3092,6 +3334,8 @@ app.post('/api/collections', authMiddleware, requireModule('collections'), async
 /** ---------- 采集数据管理（列表/详情/删除/导出） ---------- */
 function listCollectionsQuery(req) {
   const isAdmin = req.user.role === 'admin';
+  /** 非管理员传 -1，EXISTS 恒为假，避免无意义子查询匹配 */
+  const copyLogAdminId = isAdmin ? Number(req.user.sub) : -1;
   const page = Math.max(1, Number(req.query.page) || 1);
   const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 20));
   const offset = (page - 1) * limit;
@@ -3175,14 +3419,18 @@ function listCollectionsQuery(req) {
                     p.collected_at < c.collected_at
                     OR (p.collected_at = c.collected_at AND p.id < c.id)
                   )
-              ) AS urlDuplicate
+              ) AS urlDuplicate,
+              EXISTS (
+                SELECT 1 FROM admin_archive_copy_log l
+                WHERE l.source_collection_id = c.id AND l.admin_user_id = ?
+              ) AS alreadyCopiedByMe
        FROM collections c
        LEFT JOIN users u ON u.id = c.user_id
        WHERE ${where}
        ORDER BY c.collected_at DESC
        LIMIT ? OFFSET ?`
     )
-    .all(...params, limit, offset);
+    .all(copyLogAdminId, ...params, limit, offset);
 
   // 兼容旧数据：历史已导出但未持久化父 SKU 的记录，按需补齐（写回 DB，方便展示与后续搜索）。
   // 仅对本页且 exportedAt 非空的行进行，避免列表浏览时产生大量写入。
@@ -3203,6 +3451,7 @@ function listCollectionsQuery(req) {
     ...r,
     isArchived: Boolean(r.isArchived),
     urlDuplicate: Boolean(r.urlDuplicate),
+    alreadyCopiedByMe: Boolean(r.alreadyCopiedByMe),
   }));
 
   const distinctRows = db
@@ -3265,7 +3514,9 @@ app.get(
                 dest_platform_id AS destPlatformId,
                 headers_json AS headersJson,
                 created_by_user_id AS createdByUserId,
-                is_public AS isPublic
+                is_public AS isPublic,
+                original_filename AS originalFilename,
+                file_path AS filePath
            FROM export_templates
           WHERE TRIM(COALESCE(export_type_id,'')) != ''`
       )
@@ -3298,6 +3549,10 @@ app.get(
         const plat = destPlatformId ? platformById.get(destPlatformId) : null;
         const enrichKey = String(plat?.enrichKey || '').trim().toLowerCase();
         const mode = enrichKey === 'amazon' ? 'amazon' : 'generic';
+        const templateWorkbookExt = exportTemplateWorkbookExtension({
+          filePath: String(r.filePath || '').trim(),
+          originalFilename: String(r.originalFilename || '').trim(),
+        });
         return {
           id: String(r.id),
           name: String(r.name || '').trim() || String(r.id),
@@ -3306,6 +3561,7 @@ app.get(
           hasBuiltinHeaderRow: false,
           columnCount: 0,
           headerColumnCount: Array.isArray(headers) ? headers.length : 0,
+          templateWorkbookExt,
         };
       })
       .filter((x) => x.id && x.destPlatformId);
@@ -3429,6 +3685,67 @@ app.put('/api/export/column-map-draft', authMiddleware, (req, res) => {
     }
     setAppSetting(`${EXPORT_COLUMN_MAP_DRAFT_KEY_PREFIX}${exportTypeId}`, jsonStr);
     res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : '保存失败' });
+  }
+});
+
+/**
+ * 通用数据预设（每用户一份，全导出模板共享，存 app_settings）。
+ * - GET: 任意登录用户可读（仅自己的）；query.exportTypeId 已弃用，仅兼容旧客户端。
+ * - PUT: 任意登录用户可写（仅自己的）；body.exportTypeId 已弃用。
+ */
+app.get(
+  '/api/export/generic-presets',
+  authMiddleware,
+  requireModuleAny(['collections', 'data-export', 'export-mapping']),
+  (req, res) => {
+  try {
+    const uid = req.user?.sub ?? null;
+    if (uid == null) {
+      res.status(401).json({ error: '未登录' });
+      return;
+    }
+    res.json({ rows: getExportGenericPresetRowsForUser(uid) });
+  } catch (e) {
+    res.status(500).json({ error: e instanceof Error ? e.message : '读取失败' });
+  }
+});
+
+app.put(
+  '/api/export/generic-presets',
+  authMiddleware,
+  requireModuleAny(['collections', 'data-export', 'export-mapping']),
+  (req, res) => {
+  try {
+    const uid = req.user?.sub ?? null;
+    if (uid == null) {
+      res.status(401).json({ error: '未登录' });
+      return;
+    }
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const rowsIn = Array.isArray(body.rows) ? body.rows : [];
+    if (rowsIn.length > 2000) {
+      res.status(400).json({ error: '通用数据行数过多（>2000）' });
+      return;
+    }
+
+    let rows;
+    try {
+      rows = normalizeExportGenericPresetRows(rowsIn);
+    } catch (e) {
+      const status = e && typeof e === 'object' && e.status === 400 ? 400 : 500;
+      res.status(status).json({ error: e instanceof Error ? e.message : '校验失败' });
+      return;
+    }
+
+    const jsonStr = JSON.stringify(rows);
+    if (jsonStr.length > 1.5 * 1024 * 1024) {
+      res.status(400).json({ error: '通用数据过大（>1.5MB），请精简后再保存' });
+      return;
+    }
+    setAppSetting(exportGenericPresetUserKey(uid), jsonStr);
+    res.json({ ok: true, count: rows.length });
   } catch (e) {
     res.status(500).json({ error: e instanceof Error ? e.message : '保存失败' });
   }
@@ -4273,6 +4590,14 @@ async function handleCollectionsExportData(req, res) {
     columnMapDraft,
   } = parsed;
 
+  const customTplForWorkbookExt =
+    templateBuffer && exportTypeId ? getCustomExportTemplateByExportTypeId(exportTypeId) : null;
+  const workbookExt = exportTemplateWorkbookExtension(customTplForWorkbookExt);
+  const workbookMime =
+    workbookExt === 'xlsm'
+      ? 'application/vnd.ms-excel.sheet.macroEnabled.12'
+      : 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
   let exportColumnMapMode = 'builtin';
   let exportColumnMapVersion = '';
   let exportColumnMapHeaderRow = '';
@@ -4533,11 +4858,10 @@ async function handleCollectionsExportData(req, res) {
     const dataStartRowBase = Number(customTpl.dataStartRow);
     const sheetNameBase = String(customTpl.sheetName || '').trim();
 
-    const headerRow = compiled?.headerRow ?? (Number.isFinite(headerRowBase) && headerRowBase >= 1 ? Math.floor(headerRowBase) : 1);
+    const headerRow = Number.isFinite(headerRowBase) && headerRowBase >= 1 ? Math.floor(headerRowBase) : (compiled?.headerRow ?? 1);
     const dataStartRow =
-      compiled?.dataStartRow ??
-      (Number.isFinite(dataStartRowBase) && dataStartRowBase >= 1 ? Math.floor(dataStartRowBase) : 4);
-    const sheetName = compiled?.sheetName ?? (sheetNameBase ? String(sheetNameBase) : undefined);
+      Number.isFinite(dataStartRowBase) && dataStartRowBase >= 1 ? Math.floor(dataStartRowBase) : (compiled?.dataStartRow ?? 4);
+    const sheetName = sheetNameBase ? String(sheetNameBase) : compiled?.sheetName;
     exportColumnMapHeaderRow = headerRow ? String(headerRow) : '';
     exportColumnMapDataStartRow = dataStartRow ? String(dataStartRow) : '';
     exportColumnMapSheetName = sheetName ? String(sheetName) : '';
@@ -4657,14 +4981,9 @@ async function handleCollectionsExportData(req, res) {
     if (exportColumnMapDataStartRow) res.setHeader('X-Export-ColumnMap-DataStartRow', exportColumnMapDataStartRow);
     if (exportColumnMapSheetName) res.setHeader('X-Export-ColumnMap-SheetName', exportColumnMapSheetName);
     if (format === 'xlsx') {
-      res.setHeader(
-        'Content-Disposition',
-        'attachment; filename="collections.xlsx"'
-      );
-      res.setHeader(
-        'Content-Type',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-      );
+      res.setHeader('X-Export-Workbook-Extension', workbookExt);
+      res.setHeader('Content-Disposition', `attachment; filename="collections.${workbookExt}"`);
+      res.setHeader('Content-Type', workbookMime);
       res.send(await buildWorkbookBuffer());
       return;
     }
@@ -4752,13 +5071,12 @@ async function handleCollectionsExportData(req, res) {
     if (exportColumnMapHeaderRow) res.setHeader('X-Export-ColumnMap-HeaderRow', exportColumnMapHeaderRow);
     if (exportColumnMapDataStartRow) res.setHeader('X-Export-ColumnMap-DataStartRow', exportColumnMapDataStartRow);
     if (exportColumnMapSheetName) res.setHeader('X-Export-ColumnMap-SheetName', exportColumnMapSheetName);
+    if (format === 'xlsx') res.setHeader('X-Export-Workbook-Extension', workbookExt);
     const body = await buildAmazonExportBuffer();
     if (format === 'xlsx') {
-      res.setHeader('Content-Disposition', 'attachment; filename="amazon_export.xlsx"');
-      res.setHeader(
-        'Content-Type',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-      );
+      res.setHeader('X-Export-Workbook-Extension', workbookExt);
+      res.setHeader('Content-Disposition', `attachment; filename="amazon_export.${workbookExt}"`);
+      res.setHeader('Content-Type', workbookMime);
       res.send(body);
       return;
     }
@@ -4776,9 +5094,10 @@ async function handleCollectionsExportData(req, res) {
     if (exportColumnMapHeaderRow) res.setHeader('X-Export-ColumnMap-HeaderRow', exportColumnMapHeaderRow);
     if (exportColumnMapDataStartRow) res.setHeader('X-Export-ColumnMap-DataStartRow', exportColumnMapDataStartRow);
     if (exportColumnMapSheetName) res.setHeader('X-Export-ColumnMap-SheetName', exportColumnMapSheetName);
+    if (format === 'xlsx' || templateBuffer) res.setHeader('X-Export-Workbook-Extension', workbookExt);
     const tableBuf = await buildAmazonExportBuffer();
     const tableName =
-      format === 'xlsx' || templateBuffer ? 'amazon_export.xlsx' : 'amazon_export.csv';
+      format === 'xlsx' || templateBuffer ? `amazon_export.${workbookExt}` : 'amazon_export.csv';
     /** @type {{ zipName: string, ossKey?: string, absPath?: string }[]} */
     const imagesToAdd = [];
     const seenZip = new Set();
@@ -4866,6 +5185,7 @@ async function handleCollectionsExportData(req, res) {
     if (exportColumnMapHeaderRow) res.setHeader('X-Export-ColumnMap-HeaderRow', exportColumnMapHeaderRow);
     if (exportColumnMapDataStartRow) res.setHeader('X-Export-ColumnMap-DataStartRow', exportColumnMapDataStartRow);
     if (exportColumnMapSheetName) res.setHeader('X-Export-ColumnMap-SheetName', exportColumnMapSheetName);
+    if (format === 'xlsx' || templateBuffer) res.setHeader('X-Export-Workbook-Extension', workbookExt);
     // 1) 重新用 rows 构建带 collectionId 的平铺表（用于替换图片字段）
     const flat2 = [];
     /** @type {{ zipName: string, ossKey?: string, absPath?: string }[]} */
@@ -4993,7 +5313,7 @@ async function handleCollectionsExportData(req, res) {
     archive.pipe(res);
 
     archive.append(tableBuf, {
-      name: format === 'xlsx' || templateBuffer ? 'collections.xlsx' : 'collections.csv',
+      name: format === 'xlsx' || templateBuffer ? `collections.${workbookExt}` : 'collections.csv',
     });
 
     for (const ent of imagesToAdd) {
@@ -5139,6 +5459,173 @@ app.patch('/api/collections/restore', authMiddleware, requireModule('collections
     notifyCollectionsChanged({ type: 'restore', collectionIds, userId });
   }
   res.json({ ok: true, ids });
+});
+
+async function copyLocalDirRecursive(srcDir, dstDir) {
+  await fsp.mkdir(dstDir, { recursive: true });
+  const ents = await fsp.readdir(srcDir, { withFileTypes: true }).catch(() => []);
+  for (const ent of ents) {
+    const name = String(ent?.name || '');
+    if (!name) continue;
+    const src = path.join(srcDir, name);
+    const dst = path.join(dstDir, name);
+    if (ent.isDirectory()) {
+      await copyLocalDirRecursive(src, dst);
+    } else if (ent.isFile()) {
+      await fsp.copyFile(src, dst).catch(() => {});
+    }
+  }
+}
+
+/**
+ * 管理员：将其它用户已归档的采集数据复制到自己的归档库。
+ * - 复制后生成新 ID
+ * - 重新生成父 SKU（amazon_parent_sku）
+ * - exported_at 清空（默认为未导出）
+ * - 图片资源同步复制（本地或 OSS），保证后续“恢复到采集模块”后图片正常显示
+ */
+app.post('/api/admin/collections/copy-to-my-archive', authMiddleware, requireAdmin, async (req, res) => {
+  const ids = normalizeCollectionIds(req.body?.ids);
+  if (!ids.length) {
+    res.status(400).json({ error: '请提供要复制的归档记录 id 列表' });
+    return;
+  }
+
+  const placeholders = ids.map(() => '?').join(',');
+  const srcRows = db
+    .prepare(
+      `SELECT *
+         FROM collections
+        WHERE id IN (${placeholders})
+          AND COALESCE(is_archived, 0) = 1`
+    )
+    .all(...ids);
+
+  const srcById = new Map((Array.isArray(srcRows) ? srcRows : []).map((r) => [Number(r.id), r]));
+  if (srcById.size !== ids.length) {
+    res.status(400).json({ error: '包含不存在或非归档库的记录，无法复制' });
+    return;
+  }
+
+  const dupPlaceholders = ids.map(() => '?').join(',');
+  const dupRows = db
+    .prepare(
+      `SELECT source_collection_id AS id FROM admin_archive_copy_log
+        WHERE admin_user_id = ? AND source_collection_id IN (${dupPlaceholders})`
+    )
+    .all(req.user.sub, ...ids);
+  if (dupRows.length > 0) {
+    const dupIds = dupRows.map((x) => x.id).join(', ');
+    res.status(400).json({ error: `以下记录已由当前账号复制过，无法重复复制：${dupIds}` });
+    return;
+  }
+
+  const now = nowCstIso();
+  const dataDir = process.env.DB_PATH ? path.dirname(process.env.DB_PATH) : process.cwd();
+
+  /** @type {Array<{ srcId:number; newId:number }>} */
+  const created = [];
+  try {
+    const insert = db.prepare(
+      `INSERT INTO collections (
+        user_id,
+        collected_at,
+        platform,
+        url,
+        data_json,
+        generic_data_json,
+        platform_data_json,
+        exported_at,
+        is_archived,
+        archived_at,
+        images_status,
+        images_downloaded_at,
+        images_error,
+        images_manifest_json,
+        images_nobg_status,
+        images_nobg_at,
+        images_nobg_error,
+        images_storage,
+        ai_post_status,
+        ai_prompt_profile_id,
+        ai_prompt_profile_name,
+        ai_prompt_platform_key,
+        ai_prompt_profile_set_at,
+        export_dest_platform_id,
+        user_mark,
+        amazon_parent_sku
+      ) VALUES (
+        ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+      )`
+    );
+
+    for (const srcId of ids) {
+      const r = srcById.get(Number(srcId));
+      const out = insert.run(
+        req.user.sub,
+        r.collected_at,
+        r.platform ?? '',
+        r.url ?? '',
+        r.data_json ?? '{}',
+        r.generic_data_json ?? r.data_json ?? '{}',
+        r.platform_data_json ?? r.data_json ?? '{}',
+        null, // exported_at: reset to "未导出"
+        1,
+        now,
+        r.images_status ?? null,
+        r.images_downloaded_at ?? null,
+        r.images_error ?? null,
+        r.images_manifest_json ?? null,
+        r.images_nobg_status ?? null,
+        r.images_nobg_at ?? null,
+        r.images_nobg_error ?? null,
+        r.images_storage ?? null,
+        r.ai_post_status ?? null,
+        r.ai_prompt_profile_id ?? null,
+        r.ai_prompt_profile_name ?? null,
+        r.ai_prompt_platform_key ?? null,
+        r.ai_prompt_profile_set_at ?? null,
+        r.export_dest_platform_id ?? null,
+        null, // user_mark: reset
+        null // amazon_parent_sku: regenerate
+      );
+      const newId = Number(out.lastInsertRowid);
+      created.push({ srcId: Number(srcId), newId });
+    }
+
+    // 复制图片资源（按每条记录的 storage 决定走 OSS 或本地）
+    for (const { srcId, newId } of created) {
+      const r = srcById.get(Number(srcId));
+      const useOss = collectionUsesOss(r?.images_storage) && getOssConfig().enabled;
+      if (useOss) {
+        await copyOssObjectsForCollection(srcId, newId);
+      } else {
+        const srcDir = absCollectionImagesRoot(dataDir, srcId);
+        const dstDir = absCollectionImagesRoot(dataDir, newId);
+        if (fs.existsSync(srcDir)) {
+          await copyLocalDirRecursive(srcDir, dstDir);
+        }
+      }
+      // 父 SKU：写入新记录（保证唯一）
+      ensureAmazonParentSkuForCollectionId(newId);
+    }
+
+    const insertCopyLog = db.prepare(
+      `INSERT OR IGNORE INTO admin_archive_copy_log (admin_user_id, source_collection_id) VALUES (?, ?)`
+    );
+    for (const { srcId } of created) {
+      insertCopyLog.run(req.user.sub, srcId);
+    }
+
+    notifyCollectionsChanged({
+      type: 'admin-copy-to-my-archive',
+      collectionIds: created.map((x) => x.newId),
+      userId: req.user.sub,
+    });
+    res.json({ ok: true, copied: created });
+  } catch (e) {
+    res.status(500).json({ error: e?.message || String(e) });
+  }
 });
 
 app.get('/api/collections/:id', authMiddleware, requireModule('collections'), (req, res) => {
@@ -7052,6 +7539,310 @@ app.delete('/api/admin/rules/:id', authMiddleware, requireAdminOrModule('rules')
   const id = Number(req.params.id);
   db.prepare('DELETE FROM scrape_rules WHERE id = ?').run(id);
   res.json({ ok: true });
+});
+
+/** ---------- SKU 内置数据识别规则 ---------- */
+function parseJsonField(v, fallback) {
+  if (v && typeof v === 'object') return v;
+  if (typeof v !== 'string') return fallback;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return fallback;
+  }
+}
+
+function skuDetectRuleFromDbRow(r) {
+  return normalizeSkuDetectRule({
+    id: r.id,
+    name: r.name,
+    platform: r.platform,
+    matchHost: parseJsonField(r.match_host_json, []),
+    enabled: Number(r.enabled) === 1,
+    priority: Number(r.priority),
+    windowPaths: parseJsonField(r.window_paths_json, []),
+    scriptKeywords: parseJsonField(r.script_keywords_json, []),
+    arrayDetectRules: parseJsonField(r.array_detect_rules_json, {}),
+    fieldMapping: parseJsonField(r.field_mapping_json, {}),
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  });
+}
+
+function skuDetectRuleToApi(r) {
+  const rule = skuDetectRuleFromDbRow(r);
+  return {
+    ...rule,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  };
+}
+
+function normalizeSkuDetectRulePayload(body) {
+  const rule = normalizeSkuDetectRule(body || {});
+  if (!rule.name) throw new Error('规则名称必填');
+  if (!rule.platform) throw new Error('平台必填');
+  if (!rule.matchHost.length) throw new Error('匹配域名不能为空');
+  return rule;
+}
+
+function allSkuDetectRulesFromDb({ enabledOnly = false } = {}) {
+  const sql = enabledOnly
+    ? `SELECT * FROM sku_detect_rules WHERE enabled = 1 ORDER BY priority ASC, id DESC`
+    : `SELECT * FROM sku_detect_rules ORDER BY priority ASC, id DESC`;
+  return db.prepare(sql).all().map(skuDetectRuleToApi);
+}
+
+app.get('/api/sku-detect-rules/match', authMiddleware, (req, res) => {
+  const host = String(req.query.host || '').trim();
+  const platform = String(req.query.platform || '').trim();
+  if (!host) {
+    res.status(400).json({ error: 'host 必填' });
+    return;
+  }
+  const enabledRules = allSkuDetectRulesFromDb({ enabledOnly: true });
+  const matched = matchSkuDetectRules(enabledRules, host, platform);
+  const filtered = [];
+  try {
+    for (const r of enabledRules || []) {
+      const m = r && typeof r === 'object' ? r.matchHost : null;
+      const pats = Array.isArray(m) ? m : [];
+      const hostLower = String(host || '').toLowerCase();
+      const hasPat = pats.length > 0;
+      const patHit = hasPat
+        ? pats
+            .map((x) => String(x || '').toLowerCase().trim())
+            .filter(Boolean)
+            .some((p) => p === '*' || hostLower === p || hostLower.endsWith(`.${p}`) || hostLower.includes(p))
+        : false;
+      if (!patHit) {
+        filtered.push({
+          name: String(r?.name || '—'),
+          platform: String(r?.platform || ''),
+          reason: hasPat ? 'host_not_match' : 'empty_matchHost',
+        });
+      }
+    }
+  } catch {
+    // ignore
+  }
+  res.json({
+    rules: matched,
+    debug: {
+      host,
+      platform,
+      enabledCount: Array.isArray(enabledRules) ? enabledRules.length : 0,
+      matchedCount: Array.isArray(matched) ? matched.length : 0,
+      filtered,
+    },
+  });
+});
+
+app.get('/api/admin/sku-detect-rules', authMiddleware, requireAdminOrModule('rules'), (_req, res) => {
+  res.json({ rules: allSkuDetectRulesFromDb() });
+});
+
+app.post('/api/admin/sku-detect-rules', authMiddleware, requireAdminOrModule('rules'), (req, res) => {
+  let rule;
+  try {
+    rule = normalizeSkuDetectRulePayload(req.body);
+  } catch (e) {
+    res.status(400).json({ error: e?.message || '规则无效' });
+    return;
+  }
+  const info = db
+    .prepare(
+      `INSERT INTO sku_detect_rules
+        (name, platform, match_host_json, enabled, priority, window_paths_json, script_keywords_json, array_detect_rules_json, field_mapping_json, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+    .run(
+      rule.name,
+      rule.platform,
+      JSON.stringify(rule.matchHost),
+      rule.enabled ? 1 : 0,
+      rule.priority,
+      JSON.stringify(rule.windowPaths),
+      JSON.stringify(rule.scriptKeywords),
+      JSON.stringify(rule.arrayDetectRules),
+      JSON.stringify(rule.fieldMapping),
+      nowCstIso()
+    );
+  res.json({ id: info.lastInsertRowid });
+});
+
+app.put('/api/admin/sku-detect-rules/:id', authMiddleware, requireAdminOrModule('rules'), (req, res) => {
+  const id = Number(req.params.id);
+  const cur = db.prepare('SELECT id FROM sku_detect_rules WHERE id = ?').get(id);
+  if (!cur) {
+    res.status(404).json({ error: '规则不存在' });
+    return;
+  }
+  let rule;
+  try {
+    rule = normalizeSkuDetectRulePayload({ ...req.body, id });
+  } catch (e) {
+    res.status(400).json({ error: e?.message || '规则无效' });
+    return;
+  }
+  db.prepare(
+    `UPDATE sku_detect_rules SET
+      name = ?,
+      platform = ?,
+      match_host_json = ?,
+      enabled = ?,
+      priority = ?,
+      window_paths_json = ?,
+      script_keywords_json = ?,
+      array_detect_rules_json = ?,
+      field_mapping_json = ?,
+      updated_at = ?
+     WHERE id = ?`
+  ).run(
+    rule.name,
+    rule.platform,
+    JSON.stringify(rule.matchHost),
+    rule.enabled ? 1 : 0,
+    rule.priority,
+    JSON.stringify(rule.windowPaths),
+    JSON.stringify(rule.scriptKeywords),
+    JSON.stringify(rule.arrayDetectRules),
+    JSON.stringify(rule.fieldMapping),
+    nowCstIso(),
+    id
+  );
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/sku-detect-rules/:id', authMiddleware, requireAdminOrModule('rules'), (req, res) => {
+  const id = Number(req.params.id);
+  db.prepare('DELETE FROM sku_detect_rules WHERE id = ?').run(id);
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/sku-detect-rules/export', authMiddleware, requireAdminOrModule('rules'), (_req, res) => {
+  res.json({ version: '1.0', exportTime: nowCstIso(), rules: allSkuDetectRulesFromDb() });
+});
+
+app.post('/api/admin/sku-detect-rules/import', authMiddleware, requireAdminOrModule('rules'), (req, res) => {
+  const list = Array.isArray(req.body?.rules) ? req.body.rules : Array.isArray(req.body) ? req.body : [];
+  if (!list.length) {
+    res.status(400).json({ error: '导入内容中没有 rules' });
+    return;
+  }
+  const insert = db.prepare(
+    `INSERT INTO sku_detect_rules
+      (name, platform, match_host_json, enabled, priority, window_paths_json, script_keywords_json, array_detect_rules_json, field_mapping_json, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  let count = 0;
+  const tx = db.transaction((items) => {
+    for (const item of items) {
+      const rule = normalizeSkuDetectRulePayload(item);
+      insert.run(
+        rule.name,
+        rule.platform,
+        JSON.stringify(rule.matchHost),
+        rule.enabled ? 1 : 0,
+        rule.priority,
+        JSON.stringify(rule.windowPaths),
+        JSON.stringify(rule.scriptKeywords),
+        JSON.stringify(rule.arrayDetectRules),
+        JSON.stringify(rule.fieldMapping),
+        nowCstIso()
+      );
+      count += 1;
+    }
+  });
+  try {
+    tx(list);
+  } catch (e) {
+    res.status(400).json({ error: e?.message || '导入失败' });
+    return;
+  }
+  res.json({ ok: true, count });
+});
+
+function hostFromUrlOrHost(input) {
+  const s = String(input || '').trim();
+  if (!s) return '';
+  try {
+    return new URL(s).host;
+  } catch {
+    return s;
+  }
+}
+
+async function loadSkuDetectTestSources(body) {
+  const jsonValues = [];
+  const scriptTexts = [];
+  const jsonText = String(body?.json || body?.windowJson || '').trim();
+  if (jsonText) {
+    try {
+      jsonValues.push({ source: 'json', path: 'input.json', value: JSON.parse(jsonText) });
+    } catch {
+      throw new Error('粘贴的 window/context JSON 不是有效 JSON');
+    }
+  }
+  const scriptText = String(body?.script || body?.scriptText || '').trim();
+  if (scriptText) scriptTexts.push(scriptText);
+  const url = String(body?.url || '').trim();
+  if (url) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 15000);
+    try {
+      const r = await fetch(url, { signal: ctl.signal, headers: { 'user-agent': 'Mozilla/5.0 SKU Detect Tester' } });
+      const html = await r.text();
+      scriptTexts.push(html);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  return { jsonValues, scriptTexts };
+}
+
+app.post('/api/admin/sku-detect-rules/test', authMiddleware, requireAdminOrModule('rules'), async (req, res) => {
+  const host = hostFromUrlOrHost(req.body?.host || req.body?.url);
+  if (!host) {
+    res.status(400).json({ error: '请提供商品页面 URL 或 host' });
+    return;
+  }
+  let sources;
+  try {
+    sources = await loadSkuDetectTestSources(req.body || {});
+  } catch (e) {
+    res.status(400).json({ error: e?.message || '测试输入无效' });
+    return;
+  }
+  const rules = allSkuDetectRulesFromDb({ enabledOnly: true });
+  const result = detectSkuFromSources({
+    rules,
+    host,
+    platform: String(req.body?.platform || ''),
+    jsonValues: sources.jsonValues,
+    scriptTexts: sources.scriptTexts,
+  });
+  if (result.ok) {
+    res.json({
+      ok: true,
+      matchedRule: { id: result.rule.id, name: result.rule.name, platform: result.rule.platform },
+      foundPath: result.path,
+      source: result.source,
+      rawCount: result.rawCount,
+      preview: result.items.slice(0, 20).map((x) => ({
+        skuId: x.skuId,
+        color: x.color,
+        size: x.size,
+        stock: x.stock,
+        price: x.price,
+        mainImage: x.mainImage,
+      })),
+      missing: result.missing,
+      attempts: result.attempts,
+    });
+    return;
+  }
+  res.json(result);
 });
 
 app.get('/api/health', (_req, res) => {

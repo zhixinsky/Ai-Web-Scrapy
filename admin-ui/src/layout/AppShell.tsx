@@ -262,7 +262,7 @@ export default function AppShell({
                 </button>
               </div>
             ) : (
-              <div className="relative px-1 pb-1 pt-0.5">
+              <div className="relative pb-1 pl-0 pr-1 pt-0.5">
                 <button
                   type="button"
                   onClick={() => setSidebarCollapsed(true)}
@@ -274,9 +274,9 @@ export default function AppShell({
                     <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" />
                   </svg>
                 </button>
-                <div className="flex items-center justify-start gap-2 pl-1 pr-7">
-                  <BrandLogo className="h-6 w-6 shrink-0 object-contain sm:h-7 sm:w-7" />
-                  <h1 className="bg-gradient-to-r from-teal-950 via-teal-800 to-emerald-700 bg-clip-text text-center text-xs font-black leading-snug tracking-tight text-transparent sm:text-[13px]">
+                <div className="flex items-center justify-start gap-1.5 pr-7">
+                  <BrandLogo className="-ml-0.5 h-6 w-6 shrink-0 object-contain sm:h-7 sm:w-7" />
+                  <h1 className="min-w-0 flex-1 bg-gradient-to-br from-slate-800 via-teal-700 to-emerald-500 bg-clip-text text-left text-[14px] font-extrabold leading-snug tracking-tight text-transparent sm:text-[15px]">
                     AI数据采集系统
                   </h1>
                 </div>

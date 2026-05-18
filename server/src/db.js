@@ -2,6 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import bcrypt from 'bcryptjs';
+import { DEFAULT_SKU_DETECT_RULES } from './skuDetectDefaults.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'data.db');
@@ -45,6 +46,25 @@ db.exec(`
   );
   CREATE INDEX IF NOT EXISTS idx_collections_user ON collections(user_id);
   CREATE INDEX IF NOT EXISTS idx_collections_time ON collections(collected_at);
+`);
+
+/** SKU 内置数据识别规则：用于插件按平台/域名从 window/script JSON 中提取 SKU */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sku_detect_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    platform TEXT NOT NULL DEFAULT '',
+    match_host_json TEXT NOT NULL DEFAULT '[]',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    priority INTEGER NOT NULL DEFAULT 100,
+    window_paths_json TEXT NOT NULL DEFAULT '[]',
+    script_keywords_json TEXT NOT NULL DEFAULT '[]',
+    array_detect_rules_json TEXT NOT NULL DEFAULT '{}',
+    field_mapping_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_sku_detect_rules_enabled_priority ON sku_detect_rules(enabled, priority);
 `);
 
 {
@@ -92,6 +112,15 @@ db.exec(`
   const hasDefaultExport = cols.some((c) => c.name === 'default_export_platform_id');
   if (!hasDefaultExport) {
     db.exec('ALTER TABLE users ADD COLUMN default_export_platform_id TEXT NOT NULL DEFAULT ""');
+  }
+}
+
+/** 采集主副图下载完成后是否自动去背景（1=是，0=否；默认 1） */
+{
+  const cols = db.prepare('PRAGMA table_info(users)').all();
+  const hasCol = cols.some((c) => c.name === 'collection_auto_nobg');
+  if (!hasCol) {
+    db.exec('ALTER TABLE users ADD COLUMN collection_auto_nobg INTEGER NOT NULL DEFAULT 1');
   }
 }
 
@@ -375,6 +404,17 @@ db.exec(`
   }
 }
 
+/** 管理员「复制归档」溯源：同一管理员对同一源归档记录仅允许复制一次 */
+db.exec(`
+  CREATE TABLE IF NOT EXISTS admin_archive_copy_log (
+    admin_user_id INTEGER NOT NULL,
+    source_collection_id INTEGER NOT NULL,
+    copied_at TEXT NOT NULL DEFAULT (datetime('now','+8 hours')),
+    PRIMARY KEY (admin_user_id, source_collection_id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_admin_archive_copy_log_source ON admin_archive_copy_log(source_collection_id);
+`);
+
 function seedIfEmpty() {
   const n = db.prepare('SELECT COUNT(*) AS c FROM users').get().c;
   if (n > 0) return;
@@ -402,3 +442,65 @@ function seedIfEmpty() {
 }
 
 seedIfEmpty();
+
+function seedSkuDetectRulesIfEmpty() {
+  const n = db.prepare('SELECT COUNT(*) AS c FROM sku_detect_rules').get().c;
+  if (n > 0) return;
+  const stmt = db.prepare(
+    `INSERT INTO sku_detect_rules
+      (name, platform, match_host_json, enabled, priority, window_paths_json, script_keywords_json, array_detect_rules_json, field_mapping_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  for (const r of DEFAULT_SKU_DETECT_RULES) {
+    stmt.run(
+      String(r.name || ''),
+      String(r.platform || ''),
+      JSON.stringify(Array.isArray(r.matchHost) ? r.matchHost : []),
+      r.enabled === false ? 0 : 1,
+      Number.isFinite(Number(r.priority)) ? Number(r.priority) : 100,
+      JSON.stringify(Array.isArray(r.windowPaths) ? r.windowPaths : []),
+      JSON.stringify(Array.isArray(r.scriptKeywords) ? r.scriptKeywords : []),
+      JSON.stringify(r.arrayDetectRules || {}),
+      JSON.stringify(r.fieldMapping || {})
+    );
+  }
+}
+
+function removeBuiltInAliExpressSkuDetectRule() {
+  db.prepare(
+    `DELETE FROM sku_detect_rules
+      WHERE lower(trim(platform)) = 'aliexpress'
+        AND lower(trim(name)) = 'aliexpress sku 识别'`
+  ).run();
+}
+
+removeBuiltInAliExpressSkuDetectRule();
+
+seedSkuDetectRulesIfEmpty();
+
+function ensure1688SkuDetectWindowPath() {
+  const path1688 = 'window.context.result.data.Root.fields.dataJson.skuModel';
+  const pathDataJson = 'window.context.result.data.Root.fields.dataJson';
+  const pathContext = 'window.context';
+  const rows = db
+    .prepare(`SELECT id, platform, window_paths_json FROM sku_detect_rules WHERE lower(platform) LIKE '%1688%'`)
+    .all();
+  const upd = db.prepare(
+    `UPDATE sku_detect_rules SET window_paths_json = ?, updated_at = (datetime('now','+8 hours')) WHERE id = ?`
+  );
+  for (const r of rows || []) {
+    let paths = [];
+    try {
+      paths = JSON.parse(r.window_paths_json || '[]');
+    } catch {
+      paths = [];
+    }
+    if (!Array.isArray(paths)) paths = [];
+    const rest = paths.filter((p) => p !== path1688 && p !== pathDataJson && p !== pathContext);
+    const next = [pathDataJson, pathContext, path1688, ...rest];
+    if (JSON.stringify(paths) === JSON.stringify(next)) continue;
+    upd.run(JSON.stringify(next), r.id);
+  }
+}
+
+ensure1688SkuDetectWindowPath();
